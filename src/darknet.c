@@ -427,6 +427,7 @@ void visualize(char *cfgfile, char *weightfile)
 #endif
 }
 
+//Darknet的总入口
 int main(int argc, char **argv)
 {
 #ifdef _DEBUG
