@@ -467,7 +467,7 @@ int main(int argc, char **argv)
 #endif
 
     show_opencv_info();
-
+   
     if (0 == strcmp(argv[1], "average")){
         average(argc, argv);
     } else if (0 == strcmp(argv[1], "yolo")){
@@ -476,7 +476,9 @@ int main(int argc, char **argv)
         run_voxel(argc, argv);
     } else if (0 == strcmp(argv[1], "super")){
         run_super(argc, argv);
+        //主要关注部分
     } else if (0 == strcmp(argv[1], "detector")){
+        //跟进run_detector
         run_detector(argc, argv);
     } else if (0 == strcmp(argv[1], "detect")){
         float thresh = find_float_arg(argc, argv, "-thresh", .24);
