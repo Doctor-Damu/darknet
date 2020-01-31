@@ -617,22 +617,23 @@ typedef enum {
 } learning_rate_policy;
 
 // network.h
+// 定义network结构体
 typedef struct network {
-    int n;
-    int batch;
-    uint64_t *seen;
-    int *t;
-    float epoch;
+    int n; //网络的层数，调用make_network(int n)时赋值
+    int batch; //一批训练中的图片参数，和subdivsions参数相关
+    uint64_t *seen; //目前已经读入的图片张数(网络已经处理的图片张数) 
+    int *t; 
+    float epoch; //到目前为止训练了整个数据集的次数
     int subdivisions;
-    layer *layers;
+    layer *layers; //存储网络中的所有层  
     float *output;
-    learning_rate_policy policy;
-    int benchmark_layers;
-
-    float learning_rate;
-    float learning_rate_min;
-    float learning_rate_max;
-    int batches_per_cycle;
+    learning_rate_policy policy; // 学习率下降策略
+    int benchmark_layers; 
+    // 梯度下降法相关参数  
+    float learning_rate; //学习率
+    float learning_rate_min; //学习率最小值
+    float learning_rate_max;  //学习率最大值
+    int batches_per_cycle; //
     int batches_cycle_mult;
     float momentum;
     float decay;
@@ -650,7 +651,7 @@ typedef struct network {
     int num_steps;
     int burn_in;
     int cudnn_half;
-
+    // ADAM优化方法相关策略
     int adam;
     float B1;
     float B2;
@@ -684,16 +685,28 @@ typedef struct network {
     int init_sequential_subdivisions;
     int current_subdivision;
     int try_fix_nan;
-
+    //darknet 为每个 GPU 维护一个相同的 network, 每个 network 以 gpu_index 区分
     int gpu_index;
     tree *hierarchy;
 
+	//中间变量，用来暂存某层网络的输入（包含一个 batch 的输入，比如某层网络完成前向，
+    //将其输出赋给该变量，作为下一层的输入，可以参看 network.c 中的forward_network() 
     float *input;
+	// 中间变量，与上面的 input 对应，用来暂存 input 数据对应的标签数据（真实数据）
     float *truth;
+	 // 中间变量，用来暂存某层网络的敏感度图（反向传播处理当前层时，用来存储上一层的敏
+    //感度图，因为当前层会计算部分上一层的敏感度图，可以参看 network.c 中的 backward_network() 函数） 
     float *delta;
+	// 网络的工作空间, 指的是所有层中占用运算空间最大的那个层的 workspace_size, 
+    // 因为实际上在 GPU 或 CPU 中某个时刻只有一个层在做前向或反向运算
     float *workspace;
+	// 网络是否处于训练阶段的标志参数，如果是则值为1. 这个参数一般用于训练与测试阶段有不
+    // 同操作的情况，比如 dropout 层，在训练阶段才需要进行 forward_dropout_layer()
+    // 函数， 测试阶段则不需要进入到该函数
     int train;
+	// 标志参数，当前网络的活跃层 
     int index;
+	//每一层的损失，只有[yolo]层有值
     float *cost;
     float clip;
 

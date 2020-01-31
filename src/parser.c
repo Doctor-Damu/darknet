@@ -1166,16 +1166,27 @@ network parse_network_cfg(char *filename)
 
 network parse_network_cfg_custom(char *filename, int batch, int time_steps)
 {
+	// 从神经网络结构参数文件中读入所有神经网络层的结构参数，存储到sections中，
+    // sections的每个node包含一层神经网络的所有结构参数
     list *sections = read_cfg(filename);
+	// 获取sections的第一个节点，可以查看一下cfg/***.cfg文件，其实第一块参数（以[net]开头）不是某层神经网络的参数，
+    // 而是关于整个网络的一些通用参数，比如学习率，衰减率，输入图像宽高，batch大小等，
+    // 具体的关于某个网络层的参数是从第二块开始的，如[convolutional],[maxpool]...，
+    // 这些层并没有编号，只说明了层的属性，但层的参数都是按顺序在文件中排好的，读入时，
+    // sections链表上的顺序就是文件中的排列顺序。
     node *n = sections->front;
     if(!n) error("Config file has no sections");
+	// 创建网络结构并动态分配内存：输入网络层数为sections->size - 1，sections的第一段不是网络层，而是通用网络参数
     network net = make_network(sections->size - 1);
+	// 所用显卡的卡号（gpu_index在cuda.c中用extern关键字声明）
+    // 在调用parse_network_cfg()之前，使用了cuda_set_device()设置了gpu_index的值号为当前活跃GPU卡号
     net.gpu_index = gpu_index;
+	// size_params结构体元素不含指针变量
     size_params params;
 
     if (batch > 0) params.train = 0;    // allocates memory for Detection only
     else params.train = 1;              // allocates memory for Detection & Training
-
+	//提取
     section *s = (section *)n->val;
     list *options = s->options;
     if(!is_network(s)) error("First section must be [net] or [network]");
@@ -1209,6 +1220,7 @@ network parse_network_cfg_custom(char *filename, int batch, int time_steps)
     n = n->next;
     int count = 0;
     free_section(s);
+	// 此处stderr不是错误提示，而是输出结果提示，提示网络结构
     fprintf(stderr, "   layer   filters  size/strd(dil)      input                output\n");
     while(n){
         params.index = count;
@@ -1368,6 +1380,7 @@ network parse_network_cfg_custom(char *filename, int batch, int time_steps)
         free_section(s);
         n = n->next;
         ++count;
+		// 构建每一层之后，如果之后还有层，则更新params.h,params.w,params.c及params.inputs为上一层相应的输出参数
         if(n){
             if (l.antialiasing) {
                 params.h = l.input_layer->out_h;

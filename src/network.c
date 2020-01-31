@@ -234,6 +234,7 @@ char *get_layer_string(LAYER_TYPE a)
     return "none";
 }
 
+//为network结构体分配内存空间
 network make_network(int n)
 {
     network net = {0};
