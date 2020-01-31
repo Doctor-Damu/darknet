@@ -22,67 +22,108 @@ int check_mistakes = 0;
 
 static int coco_ids[] = { 1,2,3,4,5,6,7,8,9,10,11,13,14,15,16,17,18,19,20,21,22,23,24,25,27,28,31,32,33,34,35,36,37,38,39,40,41,42,43,44,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,67,70,72,73,74,75,76,77,78,79,80,81,82,84,85,86,87,88,89,90 };
 
+/*
+** 图像检测网络训练函数（针对图像检测的网络训练）
+** 输入： datacfg     训练数据描述信息文件路径及名称
+**       cfgfile     神经网络结构配置文件路径及名称
+**       weightfile  预训练参数文件路径及名称
+**       gpus        GPU卡号集合（比如使用1块GPU，那么里面只含0元素，默认使用0卡号GPU；如果使用4块GPU，那么含有0,1,2,3四个元素；如果不使用GPU，那么为空指针）
+**       ngpus       使用GPUS块数，使用一块GPU和不使用GPU时，nqpus都等于1
+**       clear       把net.seen参数设为0
+**       dont_show   
+**       calc_map    训练中是否需要计算mAP值的标志
+**       mjpeg_port  支持作为mjpeg服务器来在线获取结果，这个参数提供一个端口号
+**       show_imgs   
+**       benchmark_layers  
+** 说明：关于预训练参数文件weightfile，
+*/
+
 void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, int ngpus, int clear, int dont_show, int calc_map, int mjpeg_port, int show_imgs, int benchmark_layers)
 {
+	// 读取配置文件信息，这个函数在parse.c中
     list *options = read_data_cfg(datacfg);
+	// 从options找出训练图片路径信息，如果没找到，默认使用"data/train.list"路径下的图片信息（train.list含有标准的信息格式：<object-class> <x> <y> <width> <height>），
+    // 该文件可以由darknet提供的scripts/voc_label.py根据自行在网上下载的voc数据集生成，所以说是默认路径，其实也需要使用者自行调整，也可以任意命名，不一定要为train.list，
+    // 读入后，train_images将含有训练图片中所有图片的标签以及定位信息
     char *train_images = option_find_str(options, "train", "data/train.txt");
     char *valid_images = option_find_str(options, "valid", train_images);
     char *backup_directory = option_find_str(options, "backup", "/backup/");
-
+    
+    //构建一个计算mAP的网络
     network net_map;
+    //如果计算mAP的选项打开
     if (calc_map) {
+        //打开验证集，读取数据
         FILE* valid_file = fopen(valid_images, "r");
-        if (!valid_file) {
+        //没有验证集，那么就不计算mAP
+		if (!valid_file) {
             printf("\n Error: There is no %s file for mAP calculation!\n Don't use -map flag.\n Or set valid=%s in your %s file. \n", valid_images, train_images, datacfg);
             getchar();
             exit(-1);
         }
+		//关闭文件
         else fclose(valid_file);
-
+        // 设置当前活跃GPU卡号（即设置gpu_index=n，同时调用cudaSetDevice函数设置当前活跃的GPU卡号）
         cuda_set_device(gpus[0]);
         printf(" Prepare additional network for mAP calculation...\n");
-        net_map = parse_network_cfg_custom(cfgfile, 1, 1);
+        //后面的1,1表示batch_size和time_steps
+		net_map = parse_network_cfg_custom(cfgfile, 1, 1);
+		//类别数
         const int net_classes = net_map.layers[net_map.n - 1].classes;
 
         int k;  // free memory unnecessary arrays
         for (k = 0; k < net_map.n - 1; ++k) free_layer_custom(net_map.layers[k], 1);
-
+		//类别对应的名字
         char *name_list = option_find_str(options, "names", "data/names.list");
         int names_size = 0;
+		.// 网络(cfg文件)的类别数要和类别对应的名字个数匹配
         char **names = get_labels_custom(name_list, &names_size);
         if (net_classes != names_size) {
             printf(" Error: in the file %s number of names %d that isn't equal to classes=%d in the file %s \n",
                 name_list, names_size, net_classes, cfgfile);
             if (net_classes > names_size) getchar();
         }
+		//内存释放
         free_ptrs((void**)names, net_map.layers[net_map.n - 1].classes);
     }
-
+	//设置随机数种子
     srand(time(0));
+	// 提取配置文件名称中的主要信息，用于输出打印（并无实质作用），比如提取cfg/yolo.cfg中的yolo，用于下面的输出打印
     char *base = basecfg(cfgfile);
     printf("%s\n", base);
     float avg_loss = -1;
+	// 构建网络：用多少块GPU，就会构建多少个相同的网络（不使用GPU时，ngpus=1）
     network* nets = (network*)xcalloc(ngpus, sizeof(network));
-
+	// 为什么又来一个？
     srand(time(0));
     int seed = rand();
     int i;
+	// for循环次数为ngpus，使用多少块GPU，就循环多少次（不使用GPU时，ngpus=1，也会循环一次）
+    // 这里每一次循环都会构建一个相同的神经网络，如果提供了初始训练参数，也会为每个网络导入相同的初始训练参数
     for (i = 0; i < ngpus; ++i) {
+		// 再设置随机数种子？为啥这样做。。。
         srand(seed);
 #ifdef GPU
+       // 设置当前活跃GPU卡号（即设置gpu_index=n，同时调用cudaSetDevice函数设置当前活跃的GPU卡号）
         cuda_set_device(gpus[i]);
 #endif
+		// 解析网络配置文件
         nets[i] = parse_network_cfg(cfgfile);
-        nets[i].benchmark_layers = benchmark_layers;
-        if (weightfile) {
+        // 
+		nets[i].benchmark_layers = benchmark_layers;
+        // 有预训练模型的话就添加
+		if (weightfile) {
             load_weights(&nets[i], weightfile);
         }
+		// 如果有clear参数，把网络seen清空为0
         if (clear) *nets[i].seen = 0;
         nets[i].learning_rate *= ngpus;
     }
+	// 再次设计随机数种子
     srand(time(0));
+	// 第一块显卡上的网络
     network net = nets[0];
-
+    // 实际的batch_size等于batch和subdivisions的积
     const int actual_batch_size = net.batch * net.subdivisions;
     if (actual_batch_size == 1) {
         printf("\n Error: You set incorrect value batch=1 for Training! You should set batch=64 subdivision=64 \n");
@@ -91,30 +132,38 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     else if (actual_batch_size < 8) {
         printf("\n Warning: You set batch=%d lower than 64! It is recommended to set batch=64 subdivision=64 \n", actual_batch_size);
     }
-
+    //训练一次实际上要处理的图片数
     int imgs = net.batch * net.subdivisions * ngpus;
     printf("Learning Rate: %g, Momentum: %g, Decay: %g\n", net.learning_rate, net.momentum, net.decay);
     data train, buffer;
-
+    //[yolo]层
     layer l = net.layers[net.n - 1];
-
+    //分类数
     int classes = l.classes;
+	// #每个grid预测的BoundingBox num/yolo层个数
     float jitter = l.jitter;
-
+    //获取训练数据的路径，存储到链表里面
     list *plist = get_paths(train_images);
+	// 链表长度表示训练图片的张数
     int train_images_num = plist->size;
+	// 链表中的路径转换为字符串
     char **paths = (char **)list_to_array(plist);
-
+    // 网络的初始输入图像宽度
     int init_w = net.w;
+	// 网络的初始输入图像高度
     int init_h = net.h;
     int iter_save, iter_save_last, iter_map;
+	// 获取当前网络的训练轮次，这个应该是和seen有关系的
     iter_save = get_current_batch(net);
     iter_save_last = get_current_batch(net);
     iter_map = get_current_batch(net);
+	// mAP值
     float mean_average_precision = -1;
-    float best_map = mean_average_precision;
+    // 最好的mAP值
+	float best_map = mean_average_precision;
 
     load_args args = { 0 };
+	// 为什么要把网络参数存储到args参数列表里面？这就和Darknet加载数据的机制有关了，我们会在公众号细讲
     args.w = net.w;
     args.h = net.h;
     args.c = net.c;
@@ -141,7 +190,9 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     if (dont_show && show_imgs) show_imgs = 2;
     args.show_imgs = show_imgs;
 
+// 如果用OpenCV编译的话
 #ifdef OPENCV
+    // 训练曲线底板图，就是启动训练程序后看到的那个显示loss和map的图
     args.threads = 6 * ngpus;   // 3 for - Amazon EC2 Tesla V100: p3.2xlarge (8 logical cores) - p3.16xlarge
     //args.threads = 12 * ngpus;    // Ryzen 7 2700X (16 logical cores)
     mat_cv* img = NULL;
@@ -152,6 +203,7 @@ void train_detector(char *datacfg, char *cfgfile, char *weightfile, int *gpus, i
     sprintf(windows_name, "chart_%s.png", base);
     img = draw_train_chart(windows_name, max_img_loss, net.max_batches, number_of_lines, img_size, dont_show);
 #endif    //OPENCV
+    //跟踪相关的设置，这里不关心
     if (net.track) {
         args.track = net.track;
         args.augment_speed = net.augment_speed;
@@ -1603,9 +1655,10 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
     free_network(net);
 }
 
+//检测器入口
 void run_detector(int argc, char **argv)
 {
-    int dont_show = find_arg(argc, argv, "-dont_show");
+    int dont_show = find_arg(argc, argv, "-dont_show"); //是否展示图形界面
     int benchmark = find_arg(argc, argv, "-benchmark");
     int benchmark_layers = find_arg(argc, argv, "-benchmark_layers");
     //if (benchmark_layers) benchmark = 1;
