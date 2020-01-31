@@ -39,12 +39,28 @@ void *list_pop(list *l){
     return val;
 }
 
+/*
+ * 简介: 将 val 指针插入 list 结构体 l 中，这里相当于是用 C 实现了 C++ 中的 
+ *         list 的元素插入功能
+ * 
+ * 参数: l    链表指针
+ *         val  链表节点的元素值
+ * 
+ * 流程： list 中保存的是 node 指针. 因此，需要用 node 结构体将 val 包裹起来后才可以
+ *       插入 list 指针 l 中
+ * 
+ * 注意: 此函数类似 C++ 的 insert() 插入方式；
+ *      而 opion_insert() 函数类似 C++ map 的按值插入方式，比如 map[key]= value
+ *      
+ *      两个函数操作对象都是 list 变量， 只是操作方式略有不同。
+*/
 void list_insert(list *l, void *val)
 {
     node* newnode = (node*)xmalloc(sizeof(node));
     newnode->val = val;
     newnode->next = 0;
-
+    // 如果 list 的 back 成员为空(初始化为 0), 说明 l 到目前为止，还没有存入数据  
+    // 另外, 令 l 的 front 为 new （此后 front 将不会再变，除非删除） 
     if(!l->back){
         l->front = newnode;
         newnode->prev = 0;

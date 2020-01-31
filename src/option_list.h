@@ -3,6 +3,7 @@
 #include "darknet.h"
 #include "list.h"
 
+// kvp 键值对
 typedef struct{
     char *key;
     char *val;
