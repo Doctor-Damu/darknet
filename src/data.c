@@ -941,6 +941,37 @@ void blend_truth_mosaic(float *new_truth, int boxes, float *old_truth, int w, in
 
 #include "http_stream.h"
 
+/*
+** 可以参考，看一下对图像进行jitter处理的各种效果:
+** https://github.com/vxy10/ImageAugmentation
+** 从所有训练图片中，随机读取n张，并对这n张图片进行数据增强，同时矫正增强后的数据标签信息。最终得到的图片的宽高为w,h（原始训练集中的图片尺寸不定），也就是网络能够处理的图片尺寸，
+** 数据增强包括：对原始图片进行宽高方向上的插值缩放（两方向上缩放系数不一定相同），下面称之为缩放抖动；随机抠取或者平移图片（位置抖动）；
+** 在hsv颜色空间增加噪声（颜色抖动）；左右水平翻转，不含旋转抖动。
+** 输入： n         一个线程读入的图片张数（详见函数内部注释）
+**       paths     所有训练图片所在路径集合，是一个二维数组，每一行对应一张图片的路径（将在其中随机取n个）
+**       m         paths的行数，也即训练图片总数
+**       w         网络能够处理的图的宽度（也就是输入图片经过一系列数据增强、变换之后最终输入到网络的图的宽度）
+**       h         网络能够处理的图的高度（也就是输入图片经过一系列数据增强、变换之后最终输入到网络的图的高度）
+**       c         用来指定训练图片的通道数（默认为3，即RGB图）
+**       boxes     每张训练图片最大处理的矩形框数（图片内可能含有更多的物体，即更多的矩形框，那么就在其中随机选择boxes个参与训练，具体执行在fill_truth_detection()函数中）
+**       classes   类别总数，本函数并未用到（fill_truth_detection函数其实并没有用这个参数）
+**       use_flip  是否使用水平翻转
+**       use_mixup 是否使用mixup数据增强 
+**       jitter    这个参数为缩放抖动系数，就是图片缩放抖动的剧烈程度，越大，允许的抖动范围越大（所谓缩放抖动，就是在宽高上插值缩放图片，宽高两方向上缩放的系数不一定相同）
+**       hue       颜色（hsv颜色空间）数据增强参数：色调（取值0度到360度）偏差最大值，实际色调偏差为-hue~hue之间的随机值
+**       saturation 颜色（hsv颜色空间）数据增强参数：色彩饱和度（取值范围0~1）缩放最大值，实际为范围内的随机值
+**       exposure  颜色（hsv颜色空间）数据增强参数：明度（色彩明亮程度，0~1）缩放最大值，实际为范围内的随机值
+**       mini_batch 
+**       track 
+**       augment_speed 
+**       letter_box 是否进行letter_box变换
+**       show_imgs 
+** 返回： data类型数据，包含一个线程读入的所有图片数据（含有n张图片）
+** 说明： 最后四个参数用于数据增强，主要对原图进行缩放抖动，位置抖动（平移）以及颜色抖动（颜色值增加一定噪声），抖动一定程度上可以理解成对图像增加噪声。
+**       通过对原始图像进行抖动，实现数据增强。最后三个参数具体用法参考本函数内调用的random_distort_image()函数
+** 说明2：从此函数可以看出，darknet对训练集中图片的尺寸没有要求，可以是任意尺寸的图片，因为经该函数处理（缩放/裁剪）之后，
+**       不管是什么尺寸的照片，都会统一为网络训练使用的尺寸
+*/
 data load_data_detection(int n, char **paths, int m, int w, int h, int c, int boxes, int classes, int use_flip, int use_blur, int use_mixup,
     float jitter, float hue, float saturation, float exposure, int mini_batch, int track, int augment_speed, int letter_box, int show_imgs)
 {
@@ -948,6 +979,7 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
     c = c ? c : 3;
 
     assert(use_mixup != 2);
+	// mixup 和 letter_box策略不能共存
     if (use_mixup == 3 && letter_box) {
         printf("\n Combination: letter_box=1 & mosaic=1 - isn't supported, use only 1 of these parameters \n");
         exit(0);
@@ -1069,9 +1101,12 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
             float dx = ((float)pleft / ow) / sx;
             float dy = ((float)ptop / oh) / sy;
 
-
+			// truth包含所有图像的标签信息（包括真实类别与位置
+            // 因为对原始图片进行了数据增强，其中的平移抖动势必会改动每个物体的矩形框标签信息（主要是矩形框的像素坐标信息），需要根据具体的数据增强方式进行相应矫正
+            // 后面4个参数就是用于数据增强后的矩形框信息矫正（nw,nh是中间图宽高，w,h是最终图宽高）
             int min_w_h = fill_truth_detection(filename, boxes, truth, classes, flip, dx, dy, 1. / sx, 1. / sy, w, h);
-
+			
+			// 如果
             if ((min_w_h / 8) < blur && blur > 1) blur = min_w_h / 8;   // disable blur if one of the objects is too small
 
             image ai = image_data_augmentation(src, w, h, pleft, ptop, swidth, sheight, flip, dhue, dsat, dexp,
@@ -1195,6 +1230,38 @@ void blend_images(image new_img, float alpha, image old_img, float beta)
         new_img.data[i] = new_img.data[i] * alpha + old_img.data[i] * beta;
 }
 
+/*
+** 可以参考，看一下对图像进行jitter处理的各种效果:
+** https://github.com/vxy10/ImageAugmentation
+** 从所有训练图片中，随机读取n张，并对这n张图片进行数据增强，同时矫正增强后的数据标签信息。最终得到的图片的宽高为w,h（原始训练集中的图片尺寸不定），也就是网络能够处理的图片尺寸，
+** 数据增强包括：对原始图片进行宽高方向上的插值缩放（两方向上缩放系数不一定相同），下面称之为缩放抖动；随机抠取或者平移图片（位置抖动）；
+** 在hsv颜色空间增加噪声（颜色抖动）；左右水平翻转，不含旋转抖动。
+** 输入： n         一个线程读入的图片张数（详见函数内部注释）
+**       paths     所有训练图片所在路径集合，是一个二维数组，每一行对应一张图片的路径（将在其中随机取n个）
+**       m         paths的行数，也即训练图片总数
+**       w         网络能够处理的图的宽度（也就是输入图片经过一系列数据增强、变换之后最终输入到网络的图的宽度）
+**       h         网络能够处理的图的高度（也就是输入图片经过一系列数据增强、变换之后最终输入到网络的图的高度）
+**       c         用来指定训练图片的通道数（默认为3，即RGB图）
+**       boxes     每张训练图片最大处理的矩形框数（图片内可能含有更多的物体，即更多的矩形框，那么就在其中随机选择boxes个参与训练，具体执行在fill_truth_detection()函数中）
+**       classes   类别总数，本函数并未用到（fill_truth_detection函数其实并没有用这个参数）
+**       use_flip  是否使用水平翻转
+**       use_mixup 是否使用mixup数据增强 
+**       jitter    这个参数为缩放抖动系数，就是图片缩放抖动的剧烈程度，越大，允许的抖动范围越大（所谓缩放抖动，就是在宽高上插值缩放图片，宽高两方向上缩放的系数不一定相同）
+**       hue       颜色（hsv颜色空间）数据增强参数：色调（取值0度到360度）偏差最大值，实际色调偏差为-hue~hue之间的随机值
+**       saturation 颜色（hsv颜色空间）数据增强参数：色彩饱和度（取值范围0~1）缩放最大值，实际为范围内的随机值
+**       exposure  颜色（hsv颜色空间）数据增强参数：明度（色彩明亮程度，0~1）缩放最大值，实际为范围内的随机值
+**       mini_batch      和目标跟踪有关，这里不关注
+**       track           和目标跟踪有关，这里不关注
+**       augment_speed   和目标跟踪有关，这里不关注
+**       letter_box 是否进行letter_box变换
+**       show_imgs 
+** 返回： data类型数据，包含一个线程读入的所有图片数据（含有n张图片）
+** 说明： 最后四个参数用于数据增强，主要对原图进行缩放抖动，位置抖动（平移）以及颜色抖动（颜色值增加一定噪声），抖动一定程度上可以理解成对图像增加噪声。
+**       通过对原始图像进行抖动，实现数据增强。最后三个参数具体用法参考本函数内调用的random_distort_image()函数
+** 说明2：从此函数可以看出，darknet对训练集中图片的尺寸没有要求，可以是任意尺寸的图片，因为经该函数处理（缩放/裁剪）之后，
+**       不管是什么尺寸的照片，都会统一为网络训练使用的尺寸
+*/
+
 data load_data_detection(int n, char **paths, int m, int w, int h, int c, int boxes, int classes, int use_flip, int use_blur, int use_mixup, float jitter,
     float hue, float saturation, float exposure, int mini_batch, int track, int augment_speed, int letter_box, int show_imgs)
 {
@@ -1202,42 +1269,56 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
     c = c ? c : 3;
     char **random_paths;
     char **mixup_random_paths = NULL;
+	// paths包含所有训练图片的路径，get_random_paths函数从中随机提出n条，即为此次读入的n张图片的路径
     if(track) random_paths = get_sequential_paths(paths, n, m, mini_batch, augment_speed);
     else random_paths = get_random_paths(paths, n, m);
 
     assert(use_mixup < 2);
     int mixup = use_mixup ? random_gen() % 2 : 0;
     //printf("\n mixup = %d \n", mixup);
+	// 如果使用mixup策略，需要再随机取出n条数据，即n张图片
     if (mixup) {
         if (track) mixup_random_paths = get_sequential_paths(paths, n, m, mini_batch, augment_speed);
         else mixup_random_paths = get_random_paths(paths, n, m);
     }
 
     int i;
+	// 初始化为0,清空内存中之前的旧值
     data d = { 0 };
     d.shallow = 0;
-
+	// 一次读入的图片张数：d.X中每行就是一张图片的数据，因此d.X.cols等于h*w*3
+    // n = net.batch * net.subdivisions * ngpus，net中的subdivisions这个参数暂时还没搞懂有什么用，
+    // 从parse_net_option()函数可知，net.batch = net.batch / net.subdivision，等号右边的那个batch就是
+    // 网络配置文件.cfg中设置的每个batch的图片数量，但是不知道为什么多了subdivision这个参数？总之，
+    // net.batch * net.subdivisions又得到了在网络配置文件中设定的batch值，然后乘以ngpus，是考虑多个GPU实现数据并行，
+    // 一次读入多个batch的数据，分配到不同GPU上进行训练。在load_threads()函数中，又将整个的n仅可能均匀的划分到每个线程上，
+    // 也就是总的读入图片张数为n = net.batch * net.subdivisions * ngpus，但这些图片不是一个线程读完的，而是分配到多个线程并行读入，
+    // 因此本函数中的n实际不是总的n，而是分配到该线程上的n，比如总共要读入128张图片，共开启8个线程读数据，那么本函数中的n为16,而不是总数128
     d.X.rows = n;
+	//d.X为一个matrix类型数据，其中d.X.vals是其具体数据，是指针的指针（即为二维数组），此处先为第一维动态分配内存
     d.X.vals = (float**)xcalloc(d.X.rows, sizeof(float*));
     d.X.cols = h*w*c;
 
     float r1 = 0, r2 = 0, r3 = 0, r4 = 0, r_scale;
     float dhue = 0, dsat = 0, dexp = 0, flip = 0;
     int augmentation_calculated = 0;
-
+	// d.y存储了所有读入照片的标签信息，每条标签包含5条信息：类别，以及矩形框的x,y,w,h
+    // boxes为一张图片最多能够处理（参与训练）的矩形框的数（如果图片中的矩形框数多于这个数，那么随机挑选boxes个，这个参数仅在parse_region以及parse_detection中出现，好奇怪？    
+    // 在其他网络解析函数中并没有出现）。同样，d.y是一个matrix，make_matrix会指定y的行数和列数，同时会为其第一维动态分配内存
     d.y = make_matrix(n, 5 * boxes);
     int i_mixup = 0;
     for (i_mixup = 0; i_mixup <= mixup; i_mixup++) {
         if (i_mixup) augmentation_calculated = 0;
         for (i = 0; i < n; ++i) {
+			
             float *truth = (float*)xcalloc(5 * boxes, sizeof(float));
             char *filename = (i_mixup) ? mixup_random_paths[i] : random_paths[i];
-
+			//读入原始的图片
             image orig = load_image(filename, 0, 0, c);
-
+			// 原始图像长宽
             int oh = orig.h;
             int ow = orig.w;
-
+			// 缩放抖动大小：缩放抖动系数乘以原始图宽高即得像素单位意义上的缩放抖动
             int dw = (ow*jitter);
             int dh = (oh*jitter);
 
@@ -1262,14 +1343,14 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
             int pright = rand_precalc_random(-dw, dw, r2);
             int ptop = rand_precalc_random(-dh, dh, r3);
             int pbot = rand_precalc_random(-dh, dh, r4);
-
+			// 这个系数没用到
             float scale = rand_precalc_random(.25, 2, r_scale); // unused currently
 
             if (letter_box)
             {
-                float img_ar = (float)ow / (float)oh;
-                float net_ar = (float)w / (float)h;
-                float result_ar = img_ar / net_ar;
+                float img_ar = (float)ow / (float)oh; //原始图像宽高比
+                float net_ar = (float)w / (float)h; //输入到网络要求的图像宽高比
+                float result_ar = img_ar / net_ar; //两者求比值来判断如何进行letter_box缩放
                 //printf(" ow = %d, oh = %d, w = %d, h = %d, img_ar = %f, net_ar = %f, result_ar = %f \n", ow, oh, w, h, img_ar, net_ar, result_ar);
                 if (result_ar > 1)  // sheight - should be increased
                 {
@@ -1288,7 +1369,7 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
                     //printf(" result_ar = %f, ow_tmp = %f, delta_w = %d, pleft = %f, pright = %f \n", result_ar, ow_tmp, delta_w, pleft, pright);
                 }
             }
-
+			// 以下步骤就是执行了letter_box变换
             int swidth = ow - pleft - pright;
             int sheight = oh - ptop - pbot;
 
@@ -1299,12 +1380,16 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
 
             float dx = ((float)pleft / ow) / sx;
             float dy = ((float)ptop / oh) / sy;
-
+			// resize到指定大小
             image sized = resize_image(cropped, w, h);
-            if (flip) flip_image(sized);
+            // 翻转
+			if (flip) flip_image(sized);
+			//随机对图像jitter（在hsv三个通道上添加扰动），实现数据增强
             distort_image(sized, dhue, dsat, dexp);
             //random_distort_image(sized, hue, saturation, exposure);
-
+			// truth包含所有图像的标签信息（包括真实类别与位置
+            // 因为对原始图片进行了数据增强，其中的平移抖动势必会改动每个物体的矩形框标签信息（主要是矩形框的像素坐标信息），需要根据具体的数据增强方式进行相应矫正
+            // 后面的参数就是用于数据增强后的矩形框信息矫正
             fill_truth_detection(filename, boxes, truth, classes, flip, dx, dy, 1. / sx, 1. / sy, w, h);
 
             if (i_mixup) {
@@ -1313,7 +1398,9 @@ data load_data_detection(int n, char **paths, int m, int w, int h, int c, int bo
                 //show_image(sized, "new");
                 //show_image(old_img, "old");
                 //wait_until_press_key_cv();
+				// 做mixup，混合系数为0.5
                 blend_images(sized, 0.5, old_img, 0.5);
+				// 标签也要对应改变
                 blend_truth(truth, boxes, d.y.vals[i]);
                 free_image(old_img);
             }
@@ -1396,40 +1483,113 @@ void *load_thread(void *ptr)
     return 0;
 }
 
+/*
+** 创建一个线程，读入相应图片数据（此时args.n不再是一次迭代读入的所有图片的张数，而是经过load_threads()均匀分配给每个线程的图片张数）
+** 输入： args    包含该线程要读入图片数据的信息（读入多少张，读入图片最终的宽高，图片路径等等）
+** 返回： phtread_t   线程id
+** 说明： 本函数实际没有做什么，就是深拷贝了args给ptr,然后创建了一个调用load_thread()函数的线程并返回线程id
+*/
 pthread_t load_data_in_thread(load_args args)
 {
     pthread_t thread;
+	// 同样第一件事深拷贝了args给ptr（为什么每次都要做这一步呢？求指点啊～）
     struct load_args* ptr = (load_args*)xcalloc(1, sizeof(struct load_args));
     *ptr = args;
+	// 创建一个线程，读入相应数据，绑定load_thread()函数到该线程上，第四个参数是load_thread()的输入参数，第二个参数表示线程属性，设置为0（即NULL）
     if(pthread_create(&thread, 0, load_thread, ptr)) error("Thread creation failed");
     return thread;
 }
 
+// copy from https://github.com/hgpvision/darknet/blob/master/src/data.c#L355
+/*
+** 开辟多个线程读入图片数据，读入数据存储至ptr.d中（主要调用load_in_thread()函数完成）
+** 输入： ptr    包含所有线程要读入图片数据的信息（读入多少张，开几个线程读入，读入图片最终的宽高，图片路径等等）
+** 返回： void*  万能指针（实际上不需要返回什么）
+** 说明： 1) load_threads()是一个指针函数，只是一个返回变量为void*的普通函数，不是函数指针
+**       2) 输入ptr是一个void*指针（万能指针），使用时需要强转为具体类型的指针
+**       3) 函数中涉及四个用来存储读入数据的变量：ptr, args, out, buffers，除args外都是data*类型，所有这些变量的
+**          指针变量其实都指向同一块内存（当然函数中间有些动态变化），因此读入的数据都是互通的。
+** 流程： 本函数首先会获取要读入图片的张数、要开启线程的个数，而后计算每个线程应该读入的图片张数（尽可能的均匀分配），
+**       并创建所有的线程，并行读入数据，最后合并每个线程读入的数据至一个大data中，这个data的指针变量与ptr的指针变量
+**       指向的是统一块内存，因此也就最终将数据读入到ptr.d中（所以其实没有返回值）
+*/
 void *load_threads(void *ptr)
 {
     //srand(time(0));
     int i;
+	// 先使用(load_args*)强转void*指针，而后取ptr所指内容赋值给args
+    // 虽然args不是指针，args是深拷贝了ptr中的内容，但是要知道ptr（也就是load_args数据类型），有很多的
+    // 指针变量，args深拷贝将拷贝这些指针变量到args中（这些指针变量本身对ptr来说就是内容，
+    // 而args所指的值是args的内容，不是ptr的，不要混为一谈），因此，args与ptr将会共享所有指针变量所指的内容
     load_args args = *(load_args *)ptr;
     if (args.threads == 0) args.threads = 1;
+	// 另指针变量out=args.d，使得out与args.d指向统一块内存，之后，args.d所指的内存块会变（反正也没什么用了，变就变吧），
+    // 但out不会变，这样可以保证out与最原始的ptr指向同一块存储读入图片数据的内存块，因此最终将图片读到out中，
+    // 实际就是读到了最原始的ptr中，比如train_detector()函数中定义的args.d中
     data *out = args.d;
+	// 读入图片的总张数= batch * subdivision * ngpus，可参见train_detector()函数中的赋值
     int total = args.n;
+	// 释放ptr：ptr是传入的指针变量，传入的指针变量本身也是按值传递的，即传入函数之后，指针变量得到复制，函数内的形参ptr
+    // 获取外部实参的值之后，二者本身没有关系，但是由于是指针变量，二者之间又存在一丝关系，那就是函数内形参与函数外实参指向
+    // 同一块内存。又由于函数外实参内存是动态分配的，因此函数内的形参可以使用free()函数进行内存释放，但一般不推荐这么做，因为函数内释放内存，
+    // 会影响函数外实参的使用，可能使之成为野指针，那为什么这里可以用free()释放ptr呢，不会出现问题吗？
+    // 其一，因为ptr是一个结构体，是一个包含众多的指针变量的结构体，如data* d等（当然还有其他非指针变量如int h等），
+    // 直接free(ptr)将会导致函数外实参无法再访问非指针变量int h等（实际经过测试，在gcc编译器下，能访问但是值被重新初始化为0），
+    // 因为函数内形参和函数外实参共享一块堆内存，而这些非指针变量都是存在这块堆内存上的，内存一释放，就无法访问了；
+    // 但是对于指针变量，free(ptr)将无作为（这个结论也是经过测试的，也是用的gcc编译器），不会释放或者擦写掉ptr指针变量本身的值，
+    // 当然也不会影响函数外实参，更不会牵扯到这些指针变量所指的内存块，总的来说，
+    // free(ptr)将使得ptr不能再访问指针变量（如int h等，实际经过测试，在gcc编译器下，能访问但是值被重新初始化为0），
+    // 但其指针变量本身没有受影响，依旧可以访问；对于函数外实参，同样不能访问非指针变量，而指针变量不受影响，依旧可以访问。
+    // 其二，darknet数据读取的实现一层套一层（似乎有点罗嗦，总感觉代码可以不用这么写的:)），具体调用过程如下：
+    // load_data(load_args args)->load_threads(load_args* ptr)->load_data_in_thread(load_args args)->load_thread(load_args* ptr)，
+    // 就在load_data()中，重新定义了ptr，并为之动态分配了内存，且深拷贝了传给load_data()函数的值args，也就是说在此之后load_data()函数中的args除了其中的指针变量指着同一块堆内存之外，
+    // 二者的非指针变量再无瓜葛，不管之后经过多少个函数，对ptr的非指针变量做了什么改动，比如这里直接free(ptr)，使得非指针变量值为0,都不会影响load_data()中的args的非指针变量，也就不会影响更为顶层函数中定义的args的非指针变量的值，
+    // 比如train_detector()函数中的args，train_detector()对args非指针变量赋的值都不会受影响，保持不变。综其两点，此处直接free(ptr)是安全的。
+    // 说明：free(ptr)函数，确定会做的事是使得内存块可以重新分配，且不会影响指针变量ptr本身的值，也就是ptr还是指向那块地址， 虽然可以使用，但很危险，因为这块内存实际是无效的，
+    //      系统已经认为这块内存是可分配的，会毫不考虑的将这块内存分给其他变量，这样，其值随时都可能会被其他变量改变，这种情况下的ptr指针就是所谓的野指针（所以经常可以看到free之后，置原指针为NULL）。
+    //      而至于free(ptr)还不会做其他事情，比如会不会重新初始化这块内存为0（擦写掉），以及怎么擦写，这些操作，是不确定的，可能跟具体的编译器有关（个人猜测），
+    //      经过测试，对于gcc编译器，free(ptr)之后，ptr中的非指针变量的地址不变，但其值全部擦写为0；ptr中的指针变量，丝毫不受影响，指针变量本身没有被擦写，
+    //      存储的地址还是指向先前分配的内存块，所以ptr能够正常访问其指针变量所指的值。测试代码为darknet_test_struct_memory_free.c。
+    //      不知道这段测试代码在VS中执行会怎样，还没经过测试，也不知道换用其他编译器（darknet的Makefile文件中，指定了编译器为gcc），darknet的编译会不会有什么问题？？
+    //      关于free()，可以看看：http://blog.sina.com.cn/s/blog_615ec1630102uwle.html，文章最后有一个很有意思的比喻，但意思好像就和我这里说的有点不一样了（到底是不是编译器搞得鬼呢？？）。
     free(ptr);
+	// 每一个线程都会读入一个data，定义并分配args.thread个data的内存
     data* buffers = (data*)xcalloc(args.threads, sizeof(data));
     pthread_t* threads = (pthread_t*)xcalloc(args.threads, sizeof(pthread_t));
+	// 此处定义了多个线程，并为每个线程动态分配内存
     for(i = 0; i < args.threads; ++i){
+		// 此处就承应了上面的注释，args.d指针变量本身发生了改动，使得本函数的args.d与out不再指向同一块内存，
+        // 改为指向buffers指向的某一段内存，因为下面的load_data_in_thread()函数统一了结口，需要输入一个load_args类型参数，
+        // 实际是想把图片数据读入到buffers[i]中，只能令args.d与buffers[i]指向同一块内存
         args.d = buffers + i;
+		 // 下面这句很有意思，因为有多个线程，所有线程读入的总图片张数为total，需要将total均匀的分到各个线程上，
+        // 但很可能会遇到total不能整除的args.threads的情况，比如total = 61, args.threads =8,显然不能做到
+        // 完全均匀的分配，但又要保证读入图片的总张数一定等于total，用下面的语句刚好在尽量均匀的情况下，
+        // 保证总和为total，比如61,那么8个线程各自读入的照片张数分别为：7, 8, 7, 8, 8, 7, 8, 8
         args.n = (i+1) * total/args.threads - i * total/args.threads;
+		// 开启线程，读入数据到args.d中（也就读入到buffers[i]中）
+        // load_data_in_thread()函数返回所开启的线程，并存储之前已经动态分配内存用来存储所有线程的threads中，
+        // 方便下面使用pthread_join()函数控制相应线程
         threads[i] = load_data_in_thread(args);
     }
     for(i = 0; i < args.threads; ++i){
+		// 以阻塞的方式等待线程threads[i]结束：阻塞是指阻塞启动该子线程的母线程（此处应为主线程），
+        // 是母线程处于阻塞状态，一直等待所有子线程执行完（读完所有数据）才会继续执行下面的语句
+        // 关于多线程的使用，进行过代码测试，测试代码对应：darknet_test_pthread_join.c
         pthread_join(threads[i], 0);
     }
+	// 多个线程读入所有数据之后，分别存储到buffers[0],buffers[1]...中，接着使用concat_datas()函数将buffers中的数据全部合并成一个大数组得到out
     *out = concat_datas(buffers, args.threads);
+	 // 也就只有out的shallow敢置为0了，为什么呢？因为out是此次迭代读入的最终数据，该数据参与训练（用完）之后，当然可以深层释放了，而此前的都是中间变量，
+    // 还处于读入数据阶段，万不可设置shallow=0
     out->shallow = 0;
+	// 释放buffers，buffers也是个中间变量，切记shallow设置为1,如果设置为0,那就连out中的数据也没了
     for(i = 0; i < args.threads; ++i){
         buffers[i].shallow = 1;
         free_data(buffers[i]);
     }
+	// 最终直接释放buffers,threads，注意buffers是一个存储data的一维数组，上面循环中的内存释放，实际是释放每一个data的部分内存
+    // （这部分内存对data而言是非主要内存，不是存储读入数据的内存块，而是存储指向这些内存块的指针变量，可以释放的）
     free(buffers);
     free(threads);
     return 0;
