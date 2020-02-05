@@ -253,18 +253,32 @@ network make_network(int n)
     return net;
 }
 
+/* 
+** 前向计算网络net每一层的输出
+** state用来标记当前网络的状态，
+** 遍历net的每一层网络，从第0层到最后一层，逐层计算每层的输出
+*/
 void forward_network(network net, network_state state)
 {
-    state.workspace = net.workspace;
+	// 网络的工作空间, 指的是所有层中占用运算空间最大的那个层的 workspace_size, 
+    // 因为实际上在 GPU 或 CPU 中某个时刻只有一个层在做前向或反向运算
+    state.workspace = net.workspace; 
     int i;
+	// 遍历所有层，从第一层到最后一层，逐层进行前向传播，网络共有net.n层
     for(i = 0; i < net.n; ++i){
+		// 当前正在进行第i层的处理
         state.index = i;
+		// 获取当前层
         layer l = net.layers[i];
+		// 如果当前层的l.delta已经动态分配了内存，则调用fill_cpu()函数将其所有元素初始化为0
         if(l.delta && state.train){
+			// 第一个参数为l.delta的元素个数，第二个参数为初始化值，为0
             scal_cpu(l.outputs * l.batch, 0, l.delta, 1);
         }
         //double time = get_time_point();
+		// 前向传播: 完成当前层前向推理
         l.forward(l, state);
+		// 完成某一层的推理时，置网络的输入为当前层的输出（这将成为下一层网络的输入），注意此处更改的是state，而非原始的net
         //printf("%d - Predicted in %lf milli-seconds.\n", i, ((double)get_time_point() - time) / 1000);
         state.input = l.output;
     }
@@ -314,14 +328,28 @@ int get_predicted_class_network(network net)
     return max_index(out, k);
 }
 
+/*
+** 反向计算网络net每一层的梯度图，并进而计算每一层的权重、偏置更新值，最后完成每一层权重与偏置更新
+** 流程: 遍历net的每一层网络，从最后一层到第一层(此处所指的第一层不是指输入层，而是与输入层直接相连的第一层隐含层)进行反向传播
+*/
 void backward_network(network net, network_state state)
 {
     int i;
+	// 在进行反向传播之前先保存一下原来的net信息
     float *original_input = state.input;
     float *original_delta = state.delta;
     state.workspace = net.workspace;
     for(i = net.n-1; i >= 0; --i){
+		// 标志参数，当前网络的活跃层 
         state.index = i;
+		// i = 0时，也即已经到了网络的第1层（或者说第0层，看个人习惯了～）了，
+        // 就是直接与输入层相连的第一层隐含层（注意不是输入层，我理解的输入层就是指输入的图像数据，
+        // 严格来说，输入层不算一层网络，因为输入层没有训练参数，也没有激活函数），这个时候，不需要else中的赋值，1）对于第1层来说，其前面已经没有网络层了（输入层不算），
+        // 因此没有必要再计算前一层的参数，故没有必要在获取上一层；2）第一层的输入就是图像输入，也即整个net最原始的输入，在开始进行反向传播之前，已经用original_*变量保存了
+        // 最为原始的net，所以net.input就是第一层的输入，不需要获取上一层的输出作为当前层的输入；3）同1），第一层之前已经没有层了，
+        // 也就不需要计算上一层的delta，即不需要再将net.delta链接到prev.delta，此时进入到l.backward()中后，net.delta就是NULL（可以参看darknet.h中关于delta
+        // 的注释），也就不会再计算上一层的敏感度了（比如卷积神经网络中的backward_convolutional_layer()函数）
+        // 这几行代码就是给net.input和net.delta赋值
         if(i == 0){
             state.input = original_input;
             state.delta = original_delta;
@@ -333,6 +361,8 @@ void backward_network(network net, network_state state)
         layer l = net.layers[i];
         if (l.stopbackward) break;
         if (l.onlyforward) continue;
+		// 反向计算第i层的敏感度图、权重及偏置更新值，并更新权重、偏置（同时会计算上一层的敏感度图，
+        // 存储在net.delta中，但是还差一个环节：乘上上一层输出对加权输入的导数，也即上一层激活函数对加权输入的导数）
         l.backward(l, state);
     }
 }
