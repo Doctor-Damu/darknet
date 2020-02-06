@@ -1119,14 +1119,19 @@ size_t binary_transpose_align_input(int k, int n, float *b, char **t_bit_input, 
 }
 
 
+// 卷积层的前向传播核心代码
 void forward_convolutional_layer(convolutional_layer l, network_state state)
 {
     int out_h = convolutional_out_height(l);
     int out_w = convolutional_out_width(l);
     int i, j;
-
+	// l.outputs = l.out_h * l.out_w * l.out_c在make各网络层函数中赋值（比如make_convolutional_layer()），
+    // 对应每张输入图片的所有输出特征图的总元素个数（每张输入图片会得到n也即l.out_c张特征图）
+    // 初始化输出l.output全为0.0；输入l.outputs*l.batch为输出的总元素个数，其中l.outputs为batch
+    // 中一个输入对应的输出的所有元素的个数，l.batch为一个batch输入包含的图片张数；0表示初始化所有输出为0；
     fill_cpu(l.outputs*l.batch, 0, l.output, 1);
 
+	// 是否进行二值化操作
     if (l.xnor && (!l.align_bit_weights || state.train)) {
         if (!l.align_bit_weights || state.train) {
             binarize_weights(l.weights, l.n, l.nweights, l.binary_weights);
@@ -1137,23 +1142,32 @@ void forward_convolutional_layer(convolutional_layer l, network_state state)
         state.input = l.binary_input;
     }
 
-    int m = l.n / l.groups;
-    int k = l.size*l.size*l.c / l.groups;
-    int n = out_h*out_w;
+    int m = l.n / l.groups; // 该层的卷积核个数
+    int k = l.size*l.size*l.c / l.groups; // 该层每个卷积核的参数元素个数
+    int n = out_h*out_w; // 该层每个特征图的尺寸(元素个数)
 
     static int u = 0;
     u++;
-
+    // 该循环即为卷积计算核心代码：所有卷积核对batch中每张图片进行卷积运算
+    // 每次循环处理一张输入图片（所有卷积核对batch中一张图片做卷积运算）
     for(i = 0; i < l.batch; ++i)
     {
+		// 该循环是为了处理分组卷积
         for (j = 0; j < l.groups; ++j)
         {
+			// 当前组卷积核(也即权重)，元素个数为l.n*l.c/l.groups*l.size*l.size,
+            // 共有l.n行，l.c/l.gropus,l.c*l.size*l.size列
             float *a = l.weights +j*l.nweights / l.groups;
+			// 对输入图像进行重排之后的图像数据，所以内存空间申请为网络中最大占用内存
             float *b = state.workspace;
+			// 存储一张输入图片（多通道）当前组的输出特征图（输入图片是多通道的，输出
+            // 图片也是多通道的，有多少组卷积核就有多少组通道，每个分组后的卷积核得到一张特征图即为一个通道）
+            // 这里似乎有点拗口，可以看下分组卷积原理。
             float *c = l.output +(i*l.groups + j)*n*m;
 
             //gemm(0,0,m,n,k,1,a,k,b,n,1,c,n);
             //gemm_nn_custom(m, n, k, 1, a, k, b, n, c, n);
+			//二值网络，特殊处理，里面还有一些优化，细节很多，这里暂时不管二值网络这部分，把注意力先放在普通卷积层的计算上
             if (l.xnor && l.align_bit_weights && !state.train && l.stride_x == l.stride_y)
             {
                 memset(b, 0, l.bit_align*l.size*l.size*l.c * sizeof(float));
@@ -1278,13 +1292,21 @@ void forward_convolutional_layer(convolutional_layer l, network_state state)
             }
             else {
                 //printf(" l.index = %d - FP32 \n", l.index);
+				// 由于有分组卷积，所以获取属于当前组的输入im并按一定存储规则排列的数组b，
+				// 以方便、高效地进行矩阵（卷积）计算，详细查看该函数注释（比较复杂）
+				// 这里的im实际上只加载了一张图片的数据
+				//关于im2col的原理我会讲
                 float *im = state.input + (i*l.groups + j)*(l.c / l.groups)*l.h*l.w;
+				// 如果这里卷积核尺寸为1，是不需要改变内存排布方式
                 if (l.size == 1) {
                     b = im;
                 }
                 else {
                     //im2col_cpu(im, l.c / l.groups, l.h, l.w, l.size, l.stride, l.pad, b);
-
+					// 将多通道二维图像im变成按一定存储规则排列的数组b，
+					// 以方便、高效地进行矩阵（卷积）计算，详细查看该函数注释（比较复杂）
+					// 进行重排，l.c/groups为每张图片的通道数分组，l.h为每张图片的高度，l.w为每张图片的宽度，l.size为卷积核尺寸，l.stride为步长
+					// 得到的b为一张图片重排后的结果，也是按行存储的一维数组（共有l.c/l.groups*l.size*l.size行，l.out_w*l.out_h列）
                     im2col_cpu_ext(im,   // input
                         l.c / l.groups,     // input channels
                         l.h, l.w,           // input size (h, w)
@@ -1295,7 +1317,18 @@ void forward_convolutional_layer(convolutional_layer l, network_state state)
                         b);                 // output
 
                 }
-
+				// 此处在im2col_cpu操作基础上，利用矩阵乘法c=alpha*a*b+beta*c完成对图像卷积的操作
+				// 0,0表示不对输入a,b进行转置，
+				// m是输入a,c的行数，具体含义为每个卷积核的个数，
+				// n是输入b,c的列数，具体含义为每个输出特征图的元素个数(out_h*out_w)，
+				// k是输入a的列数也是b的行数，具体含义为卷积核元素个数乘以输入图像的通道数除以分组数（l.size*l.size*l.c/l.groups），
+				// a,b,c即为三个参与运算的矩阵（用一维数组存储）,alpha=beta=1为常系数，
+				// a为所有卷积核集合,元素个数为l.n*l.c/l.groups*l.size*l.size，按行存储，共有l*n行，l.c/l.groups*l.size*l.size列，
+				// 即a中每行代表一个可以作用在3通道上的卷积核，
+				// b为一张输入图像经过im2col_cpu重排后的图像数据（共有l.c/l.group*l.size*l.size行，l.out_w*l.out_h列），
+				// c为gemm()计算得到的值，包含一张输入图片得到的所有输出特征图（每个卷积核得到一张特征图），c中一行代表一张特征图，
+				// 各特征图铺排开成一行后，再将所有特征图并成一大行，存储在c中，因此c可视作有l.n行，l.out_h*l.out_w列。
+				// 详细查看该函数注释（比较复杂）
                 gemm(0, 0, m, n, k, 1, a, k, b, n, 1, c, n);
                 // bit-count to float
             }
@@ -1303,7 +1336,7 @@ void forward_convolutional_layer(convolutional_layer l, network_state state)
             //state.input += l.c*l.h*l.w;
         }
     }
-
+	// 如果卷积层使用了BatchNorm，那么执行forward_batchnorm，如果没有，则添加偏置
     if(l.batch_normalize){
         forward_batchnorm_layer(l, state);
     }
@@ -1312,20 +1345,21 @@ void forward_convolutional_layer(convolutional_layer l, network_state state)
     }
 
     //activate_array(l.output, m*n*l.batch, l.activation);
+	// 使用不同的激活函数
     if (l.activation == SWISH) activate_array_swish(l.output, l.outputs*l.batch, l.activation_input, l.output);
     else if (l.activation == MISH) activate_array_mish(l.output, l.outputs*l.batch, l.activation_input, l.output);
     else if (l.activation == NORM_CHAN) activate_array_normalize_channels(l.output, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output);
     else if (l.activation == NORM_CHAN_SOFTMAX) activate_array_normalize_channels_softmax(l.output, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output, 0);
     else if (l.activation == NORM_CHAN_SOFTMAX_MAXVAL) activate_array_normalize_channels_softmax(l.output, l.outputs*l.batch, l.batch, l.out_c, l.out_w*l.out_h, l.output, 1);
     else activate_array_cpu_custom(l.output, l.outputs*l.batch, l.activation);
-
+	// 二值网络，前向传播结束之后转回float
     if(l.binary || l.xnor) swap_binary(&l);
 
     //visualize_convolutional_layer(l, "conv_visual", NULL);
     //wait_until_press_key_cv();
-
+	// 暂时不懂
     if(l.assisted_excitation && state.train) assisted_excitation_forward(l, state);
-
+	// 暂时不懂
     if (l.antialiasing) {
         network_state s = { 0 };
         s.train = state.train;
