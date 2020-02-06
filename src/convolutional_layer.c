@@ -75,11 +75,26 @@ void binarize_input(float *input, int n, int size, float *binary)
     }
 }
 
+/*
+** 根据输入图像的高度，pad，卷积核尺寸以及步长计算输出的特征图的高度
+*/
 int convolutional_out_height(convolutional_layer l)
 {
+	// pad是每边补0的个数
+    // 当stride=1, pad=size/2(整数除法，会向下取整)时, 输出高度等于输入高度(same策略)
+    // 当stride=1,pad=0时，为valid策略
+    // 当stride不等于1时，输出高度恒小于输入高度（尺寸一定会缩小）
+    // 计算公式推导：设输出高度为x，总图像高度为h+2*pad个像素，输出高度为x，则共有x-1次卷积核移位，
+    // 共占有(x-1)*stride+size个像素，可能还剩余res个像素，且res一定小于stride（否则还可以再移位一次），
+    // 因此有(x-1)*stride+size+res=h+2*pad，->x=(h+2*pad-size)/stride+1-res/stride，因为res<stride，
+    // 对于整数除法来说，值为0,于是得到最终的输出高度为x=(h+2*pad-size)/stride+1
     return (l.h + 2*l.pad - l.size) / l.stride_y + 1;
 }
 
+
+/*
+** 和上个函数原理一样
+*/
 int convolutional_out_width(convolutional_layer l)
 {
     return (l.w + 2*l.pad - l.size) / l.stride_x + 1;
@@ -370,7 +385,34 @@ void free_convolutional_batchnorm(convolutional_layer *l)
     }
 }
 
-convolutional_layer make_convolutional_layer(int batch, int steps, int h, int w, int c, int n, int groups, int size, int stride_x, int stride_y, int dilation, int padding, ACTIVATION activation, int batch_normalize, int binary, int xnor, int adam, int use_bin_output, int index, int antialiasing, convolutional_layer *share_layer, int assisted_excitation, int deform, int train)
+
+/*
+** batch 每个batch含有的图片数
+** step 
+** h 图像高度(行数)
+** w 图像宽度(列数)
+** c 输入图像通道数
+** n 卷积核个数
+** groups 分组数
+** size 卷积核尺寸
+** stride 步长
+** dilation 空洞卷积空洞率
+** padding 四周补0长度
+** activation 激活函数类别
+** batch_normalize 是否进行BN
+** binary 是否对权重进行二值化
+** xnor 是否对权重以及输入进行二值化
+** adam 优化方式
+** use_bin_output 
+** index 分组卷积的时候分组索引
+** antialiasing 抗锯齿标志，如果为真强行设置所有的步长为1
+** share_layer 标志参数，表示这一个卷积层是否和其它卷积层贡献权重
+** assisted_excitation
+** deform 暂时不知道
+** train 标志参数，是否在训练
+*/
+convolutional_layer make_convolutional_layer(int batch, int steps, int h, int w, int c, int n, int groups, int size, int stride_x, int stride_y, int dilation, int padding, ACTIVATION activation,
+ int batch_normalize, int binary, int xnor, int adam, int use_bin_output, int index, int antialiasing, convolutional_layer *share_layer, int assisted_excitation, int deform, int train)
 {
     int total_batch = batch*steps;
     int i;
@@ -378,7 +420,7 @@ convolutional_layer make_convolutional_layer(int batch, int steps, int h, int w,
     l.type = CONVOLUTIONAL;
     l.train = train;
 
-    if (xnor) groups = 1;   // disable groups for XNOR-net
+    if (xnor) groups = 1;   //对于二值网络，不能使用分组卷积
     if (groups < 1) groups = 1;
 
     const int blur_stride_x = stride_x;
@@ -410,8 +452,10 @@ convolutional_layer make_convolutional_layer(int batch, int steps, int h, int w,
     l.pad = padding;
     l.batch_normalize = batch_normalize;
     l.learning_rate_scale = 1;
+	// 该卷积层总的权重元素个数（权重元素个数等于输入数据的通道数/分组数*卷积核个数*卷积核的二维尺寸，注意因为每一个卷积核是同时作用于输入数据
+    // 的多个通道上的，因此实际上卷积核是三维的，包括两个维度的平面尺寸，以及输入数据通道数这个维度，每个通道上的卷积核参数都是独立的训练参数）
     l.nweights = (c / groups) * n * size * size;
-
+	// 如果是共享卷积层，可以直接用共享的卷积层来赋值（猜测是有预训练权重的时候可以直接赋值）
     if (l.share_layer) {
         if (l.size != l.share_layer->size || l.nweights != l.share_layer->nweights || l.c != l.share_layer->c || l.n != l.share_layer->n) {
             printf("Layer size, nweights, channels or filters don't match for the share_layer");
@@ -425,32 +469,46 @@ convolutional_layer make_convolutional_layer(int batch, int steps, int h, int w,
         l.bias_updates = l.share_layer->bias_updates;
     }
     else {
+			// 该卷积层总的权重元素(卷积核元素)个数=输入图像通道数 / 分组数*卷积核个数*卷积核尺寸
         l.weights = (float*)xcalloc(l.nweights, sizeof(float));
+		// bias就是Wx+b中的b（上面的weights就是W），有多少个卷积核，就有多少个b（与W的个数一一对应，每个W的元素个数为c*size*size）
         l.biases = (float*)xcalloc(n, sizeof(float));
-
+		// 训练期间，需要执行反向传播
         if (train) {
+			// 敏感图和特征图的尺寸应该是一样的
             l.weight_updates = (float*)xcalloc(l.nweights, sizeof(float));
+			// bias的敏感图，维度和bias一致
             l.bias_updates = (float*)xcalloc(n, sizeof(float));
         }
     }
 
     // float scale = 1./sqrt(size*size*c);
+	// 初始化权重：缩放因子*标准正态分布随机数，缩放因子等于sqrt(2./(size*size*c))，随机初始化
+    // 此处初始化权重为正态分布，而在全连接层make_connected_layer()中初始化权重是均匀分布的。
+    // TODO：个人感觉，这里应该加一个if条件语句：if(weightfile)，因为如果导入了预训练权重文件，就没有必要这样初始化了（事实上在detector.c的train_detector()函数中，
+    // 紧接着parse_network_cfg()函数之后，就添加了if(weightfile)语句判断是否导入权重系数文件，如果导入了权重系数文件，也许这里初始化的值也会覆盖掉，
+    // 总之这里的权重初始化的处理方式还是值得思考的，也许更好的方式是应该设置专门的函数进行权重的初始化，同时偏置也是，不过这里似乎没有考虑偏置的初始化，在make_connected_layer()中倒是有。。。）
     float scale = sqrt(2./(size*size*c/groups));
     for(i = 0; i < l.nweights; ++i) l.weights[i] = scale*rand_uniform(-1, 1);   // rand_normal();
+	// 根据该层输入图像的尺寸、卷积核尺寸以及跨度计算输出特征图的宽度和高度
     int out_h = convolutional_out_height(l);
     int out_w = convolutional_out_width(l);
+	// 输出图像高度
     l.out_h = out_h;
+	// 输出图像宽度	
     l.out_w = out_w;
+	// 输出图像通道数(等于卷积核个数,有多少个卷积核，最终就得到多少张特征图，每张特征图是一个通道)
     l.out_c = n;
-    l.outputs = l.out_h * l.out_w * l.out_c;
-    l.inputs = l.w * l.h * l.c;
+    l.outputs = l.out_h * l.out_w * l.out_c; // 对应每张输入图片的所有输出特征图的总元素个数（每张输入图片会得到n也即l.out_c张特征图）
+    l.inputs = l.w * l.h * l.c; // mini-batch中每张输入图片的像素元素个数
     l.activation = activation;
 
-    l.output = (float*)xcalloc(total_batch*l.outputs, sizeof(float));
+    l.output = (float*)xcalloc(total_batch*l.outputs, sizeof(float)); // l.output为该层所有的输出（包括mini-batch所有输入图片的输出）
 #ifndef GPU
-    if (train) l.delta = (float*)xcalloc(total_batch*l.outputs, sizeof(float));
+    if (train) l.delta = (float*)xcalloc(total_batch*l.outputs, sizeof(float));  // l.delta 该层的敏感度图，和输出的维度想同
 #endif  // not GPU
 
+	// 卷积层三种指针函数，对应三种计算：前向，反向，更新
     l.forward = forward_convolutional_layer;
     l.backward = backward_convolutional_layer;
     l.update = update_convolutional_layer;
