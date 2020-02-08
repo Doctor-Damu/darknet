@@ -1479,7 +1479,17 @@ void assisted_excitation_forward(convolutional_layer l, network_state state)
     free(a_avg);
 }
 
-
+/*
+** 卷积神经网络反向传播核心函数
+** 主要流程：1） 调用gradient_array()计算当前层l所有输出元素关于加权输入的导数值（也即激活函数关于输入的导数值），
+**             并乘上上一次调用backward_convolutional_layer()还没计算完的l.delta，得到当前层最终的敏感度图；
+**          2） 如果网络进行了BN，则backward_batchnorm_layer。
+**          3） 如果网络没有进行BN，则直接调用 backward_bias()计算当前层所有卷积核的偏置更新值；
+**          4） 依次调用im2col_cpu()，gemm_nt()函数计算当前层权重系数更新值；
+**          5） 如果上一层的delta已经动态分配了内存，则依次调用gemm_tn(), col2im_cpu()计算上一层的敏感度图（并未完成所有计算，还差一个步骤）；
+** 强调：每次调用本函数会计算完成当前层的敏感度计算，同时计算当前层的偏置、权重更新值，除此之外，还会计算上一层的敏感度图，但是要注意的是，
+**      并没有完全计算完，还差一步：乘上激活函数对加权输入的导数值。这一步在下一次调用本函数时完成。
+*/
 void backward_convolutional_layer(convolutional_layer l, network_state state)
 {
     int i, j;
