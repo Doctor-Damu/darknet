@@ -15,22 +15,30 @@ region_layer make_region_layer(int batch, int w, int h, int n, int classes, int 
 {
     region_layer l = { (LAYER_TYPE)0 };
     l.type = REGION;
-
-    l.n = n;
+	// 这些变量都可以参考darknet.h中的注释
+    l.n = n; //一个cell中预测多少个box
     l.batch = batch;
-    l.h = h;
-    l.w = w;
-    l.classes = classes;
-    l.coords = coords;
-    l.cost = (float*)xcalloc(1, sizeof(float));
-    l.biases = (float*)xcalloc(n * 2, sizeof(float));
+    l.h = h; //region_layer输出的通道数和输入尺寸一样，通道数也一样
+    l.w = w; //同上
+    l.classes = classes; //类别数
+    l.coords = coords; //定位一个物体所需的参数个数（一般值为4,包括矩形中心点坐标x,y以及长宽w,h）
+    l.cost = (float*)xcalloc(1, sizeof(float)); //目标函数值，为单精度浮点型指针
+    l.biases = (float*)xcalloc(n * 2, sizeof(float)); 
     l.bias_updates = (float*)xcalloc(n * 2, sizeof(float));
-    l.outputs = h*w*n*(classes + coords + 1);
-    l.inputs = l.outputs;
-    l.max_boxes = max_boxes;
+    l.outputs = h*w*n*(classes + coords + 1);  //一张训练图片经过region_layer层后得到的输出元素个数（等于网格数*每个网格预测的矩形框数*每个矩形框的参数个数）
+    l.inputs = l.outputs;   //一张训练图片输入到reigon_layer层的元素个数（注意是一张图片，对于region_layer，输入和输出的元素个数相等）
+    /**
+     * 每张图片含有的真实矩形框参数的个数（max_boxes表示一张图片中最多有max_boxes个ground truth矩形框，每个真实矩形框有
+     * 5个参数，包括x,y,w,h四个定位参数，以及物体类别）,注意max_boxes是darknet程序内写死的，实际上每张图片可能
+     * 并没有max_boxes个真实矩形框，也能没有这么多参数，但为了保持一致性，还是会留着这么大的存储空间，只是其中的
+     * 值未空而已.
+    */
+	l.max_boxes = max_boxes;
     l.truths = max_boxes*(5);
-    l.delta = (float*)xcalloc(batch * l.outputs, sizeof(float));
-    l.output = (float*)xcalloc(batch * l.outputs, sizeof(float));
+    l.delta = (float*)xcalloc(batch * l.outputs, sizeof(float)); //l.delta,l.input,l.output三个参数的大小是一样的
+    //region_layer的输出维度是l.out_w*l.out_h，等于输出的维度，输出的通道数为l.out_c，也即是输入的通道数，具体为：n*(classes+coords+1)
+	//YOLO检测模型将图片分成S*S个网格，每个网格又预测B个矩形框，最后一层输出的就是这些网格中包含的所有矩形框的信息
+	l.output = (float*)xcalloc(batch * l.outputs, sizeof(float)); 
     int i;
     for(i = 0; i < n*2; ++i){
         l.biases[i] = .5;
@@ -77,6 +85,14 @@ void resize_region_layer(layer *l, int w, int h)
 #endif
 }
 
+//获取某个矩形框的4个定位信息，即根据输入的矩形框索引从l.output中获取该矩形框的定位信息x,y,w,h
+//x  region_layer的输出，即l.output，包含所有batch预测得到的矩形框信息
+//biases 表示Anchor框的长和宽
+//index 矩形框的首地址（索引，矩形框中存储的首个参数x在l.output中的索引）
+//i 第几行（region_layer维度为l.out_w*l.out_c）
+//j 第几列
+//w 特征图的宽度
+//h 特征图的高度
 box get_region_box(float *x, float *biases, int n, int index, int i, int j, int w, int h)
 {
     box b;
@@ -170,6 +186,60 @@ float tisnan(float x)
     return (x != x);
 }
 
+/** 
+ * @brief 计算某个矩形框中某个参数在l.output中的索引。一个矩形框包含了x,y,w,h,c,C1,C2...,Cn信息，
+ *        前四个用于定位，第五个为矩形框含有物体的置信度信息c，即矩形框中存在物体的概率为多大，而C1到Cn
+ *        为矩形框中所包含的物体分别属于这n类物体的概率。本函数负责获取该矩形框首个定位信息也即x值在
+ *        l.output中索引、获取该矩形框自信度信息c在l.output中的索引、获取该矩形框分类所属概率的首个
+ *        概率也即C1值的索引，具体是获取矩形框哪个参数的索引，取决于输入参数entry的值，这些在
+ *        forward_region_layer()函数中都有用到，由于l.output的存储方式，当entry=0时，就是获取矩形框
+ *        x参数在l.output中的索引；当entry=4时，就是获取矩形框自信度信息c在l.output中的索引；当
+ *        entry=5时，就是获取矩形框首个所属概率C1在l.output中的索引，具体可以参考forward_region_layer()
+ *        中调用本函数时的注释.
+ * @param l 当前region_layer
+ * @param batch 当前照片是整个batch中的第几张，因为l.output中包含整个batch的输出，所以要定位某张训练图片
+ *              输出的众多网格中的某个矩形框，当然需要该参数.
+ * @param location 这个参数，说实话，感觉像个鸡肋参数，函数中用这个参数获取n和loc的值，这个n就是表示网格中
+ *                 的第几个预测矩形框（比如每个网格预测5个矩形框，那么n取值范围就是从0~4），loc就是某个
+ *                 通道上的元素偏移（region_layer输出的通道数为l.out_c = (classes + coords + 1)），
+ *                 这样说可能没有说明白，这都与l.output的存储结构相关，见下面详细注释以及其他说明。总之，
+ *                 查看一下调用本函数的父函数forward_region_layer()就知道了，可以直接输入n和j*l.w+i的，
+ *                 没有必要输入location，这样还得重新计算一次n和loc.               
+ * @param entry 切入点偏移系数，关于这个参数，就又要扯到l.output的存储结构了，见下面详细注释以及其他说明.
+ * @details l.output这个参数的存储内容以及存储方式已经在多个地方说明了，再多的文字都不及图文说明，此处再
+ *          简要罗嗦几句，更为具体的参考图文说明。l.output中存储了整个batch的训练输出，每张训练图片都会输出
+ *          l.out_w*l.out_h个网格，每个网格会预测l.n个矩形框，每个矩形框含有l.classes+l.coords+1个参数，
+ *          而最后一层的输出通道数为l.n*(l.classes+l.coords+1)，可以想象下最终输出的三维张量是个什么样子的。
+ *          展成一维数组存储时，l.output可以首先分成batch个大段，每个大段存储了一张训练图片的所有输出；进一步细分，
+ *          取其中第一大段分析，该大段中存储了第一张训练图片所有输出网格预测的矩形框信息，每个网格预测了l.n个矩形框，
+ *          存储时，l.n个矩形框是分开存储的，也就是先存储所有网格中的第一个矩形框，而后存储所有网格中的第二个矩形框，
+ *          依次类推，如果每个网格中预测5个矩形框，则可以继续把这一大段分成5个中段。继续细分，5个中段中取第
+ *          一个中段来分析，这个中段中按行（有l.out_w*l.out_h个网格，按行存储）依次存储了这张训练图片所有输出网格中
+ *          的第一个矩形框信息，要注意的是，这个中段存储的顺序并不是挨个挨个存储每个矩形框的所有信息，
+ *          而是先存储所有矩形框的x，而后是所有的y,然后是所有的w,再是h，c，最后的的概率数组也是拆分进行存储，
+ *          并不是一下子存储完一个矩形框所有类的概率，而是先存储所有网格所属第一类的概率，再存储所属第二类的概率，
+ *          具体来说这一中段首先存储了l.out_w*l.out_h个x，然后是l.out_w*l.out_c个y，依次下去，
+ *          最后是l.out_w*l.out_h个C1（属于第一类的概率，用C1表示，下面类似），l.out_w*l.outh个C2,...,
+ *          l.out_w*l.out_c*Cn（假设共有n类），所以可以继续将中段分成几个小段，依次为x,y,w,h,c,C1,C2,...Cn
+ *          小段，每小段的长度都为l.out_w*l.out_c.
+ *          现在回过来看本函数的输入参数，batch就是大段的偏移数（从第几个大段开始，对应是第几张训练图片），
+ *          由location计算得到的n就是中段的偏移数（从第几个中段开始，对应是第几个矩形框），
+ *          entry就是小段的偏移数（从几个小段开始，对应具体是那种参数，x,c还是C1），而loc则是最后的定位，
+ *          前面确定好第几大段中的第几中段中的第几小段的首地址，loc就是从该首地址往后数loc个元素，得到最终定位
+ *          某个具体参数（x或c或C1）的索引值，比如l.output中存储的数据如下所示（这里假设只存了一张训练图片的输出，
+ *          因此batch只能为0；并假设l.out_w=l.out_h=2,l.classes=2）：
+ *          xxxxyyyywwwwhhhhccccC1C1C1C1C2C2C2C2-#-xxxxyyyywwwwhhhhccccC1C1C1C1C2C2C2C2，
+ *          n=0则定位到-#-左边的首地址（表示每个网格预测的第一个矩形框），n=1则定位到-#-右边的首地址（表示每个网格预测的第二个矩形框）
+ *          entry=0,loc=0获取的是x的索引，且获取的是第一个x也即l.out_w*l.out_h个网格中第一个网格中第一个矩形框x参数的索引；
+ *          entry=4,loc=1获取的是c的索引，且获取的是第二个c也即l.out_w*l.out_h个网格中第二个网格中第一个矩形框c参数的索引；
+ *          entry=5,loc=2获取的是C1的索引，且获取的是第三个C1也即l.out_w*l.out_h个网格中第三个网格中第一个矩形框C1参数的索引；
+ *          如果要获取第一个网格中第一个矩形框w参数的索引呢？如果已经获取了其x值的索引，显然用x的索引加上3*l.out_w*l.out_h即可获取到，
+ *          这正是delta_region_box()函数的做法；
+ *          如果要获取第三个网格中第一个矩形框C2参数的索引呢？如果已经获取了其C1值的索引，显然用C1的索引加上l.out_w*l.out_h即可获取到，
+ *          这正是delta_region_class()函数中的做法；
+ *          由上可知，entry=0时,即偏移0个小段，是获取x的索引；entry=4,是获取自信度信息c的索引；entry=5，是获取C1的索引.
+ *          l.output的存储方式大致就是这样，个人觉得说的已经很清楚了，但可视化效果终究不如图文说明～
+*/
 static int entry_index(layer l, int batch, int location, int entry)
 {
     int n = location / (l.w*l.h);
