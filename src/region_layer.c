@@ -513,7 +513,6 @@ void forward_region_layer(const region_layer l, network_state state)
  * yolov2 reorg层反向传播函数
  * @param l 当前reorg层
  * @param net 整个网络
- * 说明：其实这部分其实作者已经写入到前向传播函数中了
  */
 void backward_region_layer(const region_layer l, network_state state)
 {
