@@ -184,30 +184,38 @@ static inline float clip_value(float val, const float max_val)
     return val;
 }
 
-
+// 计算预测边界框的误差
 ious delta_yolo_box(box truth, float *x, float *biases, int n, int index, int i, int j, int lw, int lh, int w, int h, float *delta, float scale, int stride, float iou_normalizer, IOU_LOSS iou_loss, int accumulate, int max_delta)
 {
     ious all_ious = { 0 };
     // i - step in layer width
     // j - step in layer height
     //  Returns a box in absolute coordinates
+	// 获得第j*w+i个cell的第n个bbox在当前特征图的[x,y,w,h]
     box pred = get_yolo_box(x, biases, n, index, i, j, lw, lh, w, h, stride);
+	//iou
     all_ious.iou = box_iou(pred, truth);
+	//giou
     all_ious.giou = box_giou(pred, truth);
+	//diou 
     all_ious.diou = box_diou(pred, truth);
+	//ciou
     all_ious.ciou = box_ciou(pred, truth);
     // avoid nan in dx_box_iou
+	
     if (pred.w == 0) { pred.w = 1.0; }
     if (pred.h == 0) { pred.h = 1.0; }
     if (iou_loss == MSE)    // old loss
     {
-        float tx = (truth.x*lw - i);
+		// 计算GT bbox的tx, ty, tw, th
+        float tx = (truth.x*lw - i); //和预测值匹配
         float ty = (truth.y*lh - j);
-        float tw = log(truth.w*w / biases[2 * n]);
+        float tw = log(truth.w*w / biases[2 * n]); //log 使大框和小框的误差影响接近
         float th = log(truth.h*h / biases[2 * n + 1]);
 
         // accumulate delta
-        delta[index + 0 * stride] += scale * (tx - x[index + 0 * stride]) * iou_normalizer;
+		//计算tx, ty, tw, th的梯度
+        delta[index + 0 * stride] += scale * (tx - x[index + 0 * stride]) * iou_normalizer;  //计算误差 delta，乘了权重系数 scale=(2-truth.w*truth.h)
         delta[index + 1 * stride] += scale * (ty - x[index + 1 * stride]) * iou_normalizer;
         delta[index + 2 * stride] += scale * (tw - x[index + 2 * stride]) * iou_normalizer;
         delta[index + 3 * stride] += scale * (th - x[index + 3 * stride]) * iou_normalizer;
@@ -263,7 +271,7 @@ ious delta_yolo_box(box truth, float *x, float *biases, int n, int index, int i,
         delta[index + 2 * stride] += dw;
         delta[index + 3 * stride] += dh;
     }
-
+    //返回梯度
     return all_ious;
 }
 
@@ -284,10 +292,11 @@ void averages_yolo_deltas(int class_index, int box_index, int stride, int classe
     }
 }
 
+//计算类别误差
 void delta_yolo_class(float *output, float *delta, int index, int class_id, int classes, int stride, float *avg_cat, int focal_loss, float label_smooth_eps, float *classes_multipliers)
 {
     int n;
-    if (delta[index + stride*class_id]){
+    if (delta[index + stride*class_id]){ //应该不会进入这个判断，因为 delta[index] 初值为0
         delta[index + stride*class_id] = (1 - label_smooth_eps) - output[index + stride*class_id];
         if (classes_multipliers) delta[index + stride*class_id] *= classes_multipliers[class_id];
         if(avg_cat) *avg_cat += output[index + stride*class_id];
@@ -305,7 +314,7 @@ void delta_yolo_class(float *output, float *delta, int index, int class_id, int 
         float grad = -(1 - pt) * (2 * pt*logf(pt) + pt - 1);    // http://blog.csdn.net/linmingan/article/details/77885832
         //float grad = (1 - pt) * (2 * pt*logf(pt) + pt - 1);    // https://github.com/unsky/focal-loss
 
-        for (n = 0; n < classes; ++n) {
+        for (n = 0; n < classes; ++n) { //对所有类别，如果预测正确，则误差为 1-predict，否则为 0-predict
             delta[index + stride*n] = (((n == class_id) ? 1 : 0) - output[index + stride*n]);
 
             delta[index + stride*n] *= alpha*grad;
@@ -336,6 +345,60 @@ int compare_yolo_class(float *output, int classes, int class_index, int stride, 
     return 0;
 }
 
+/** 
+ * @brief 计算某个矩形框中某个参数在l.output中的索引。一个矩形框包含了x,y,w,h,c,C1,C2...,Cn信息，
+ *        前四个用于定位，第五个为矩形框含有物体的置信度信息c，即矩形框中存在物体的概率为多大，而C1到Cn
+ *        为矩形框中所包含的物体分别属于这n类物体的概率。本函数负责获取该矩形框首个定位信息也即x值在
+ *        l.output中索引、获取该矩形框置信度信息c在l.output中的索引、获取该矩形框分类所属概率的首个
+ *        概率也即C1值的索引，具体是获取矩形框哪个参数的索引，取决于输入参数entry的值，这些在
+ *        forward_region_layer()函数中都有用到，由于l.output的存储方式，当entry=0时，就是获取矩形框
+ *        x参数在l.output中的索引；当entry=4时，就是获取矩形框置信度信息c在l.output中的索引；当
+ *        entry=5时，就是获取矩形框首个所属概率C1在l.output中的索引，具体可以参考forward_region_layer()
+ *        中调用本函数时的注释.
+ * @param l 当前region_layer
+ * @param batch 当前照片是整个batch中的第几张，因为l.output中包含整个batch的输出，所以要定位某张训练图片
+ *              输出的众多网格中的某个矩形框，当然需要该参数.
+ * @param location 这个参数，说实话，感觉像个鸡肋参数，函数中用这个参数获取n和loc的值，这个n就是表示网格中
+ *                 的第几个预测矩形框（比如每个网格预测5个矩形框，那么n取值范围就是从0~4，loc就是某个
+ *                 通道上的元素偏移（region_layer输出的通道数为l.out_c = (classes + coords + 1)，
+ *                 这样说可能没有说明白，这都与l.output的存储结构相关，见下面详细注释以及其他说明。总之，
+ *                 查看一下调用本函数的父函数forward_region_layer()就知道了，可以直接输入n和j*l.w+i的，
+ *                 没有必要输入location，这样还得重新计算一次n和loc.               
+ * @param entry 切入点偏移系数，关于这个参数，就又要扯到l.output的存储结构了，见下面详细注释以及其他说明.
+ * @details l.output这个参数的存储内容以及存储方式已经在多个地方说明了，再多的文字都不及图文说明，此处再
+ *          简要罗嗦几句，更为具体的参考图文说明。l.output中存储了整个batch的训练输出，每张训练图片都会输出
+ *          l.out_w*l.out_h个网格，每个网格会预测l.n个矩形框，每个矩形框含有l.classes+l.coords+1个参数，
+ *          而最后一层的输出通道数为l.n*(l.classes+l.coords+1)，可以想象下最终输出的三维张量是个什么样子的。
+ *          展成一维数组存储时，l.output可以首先分成batch个大段，每个大段存储了一张训练图片的所有输出；进一步细分，
+ *          取其中第一大段分析，该大段中存储了第一张训练图片所有输出网格预测的矩形框信息，每个网格预测了l.n个矩形框，
+ *          存储时，l.n个矩形框是分开存储的，也就是先存储所有网格中的第一个矩形框，而后存储所有网格中的第二个矩形框，
+ *          依次类推，如果每个网格中预测5个矩形框，则可以继续把这一大段分成5个中段。继续细分，5个中段中取第
+ *          一个中段来分析，这个中段中按行（有l.out_w*l.out_h个网格，按行存储）依次存储了这张训练图片所有输出网格中
+ *          的第一个矩形框信息，要注意的是，这个中段存储的顺序并不是挨个挨个存储每个矩形框的所有信息，
+ *          而是先存储所有矩形框的x，而后是所有的y,然后是所有的w,再是h，c，最后的的概率数组也是拆分进行存储，
+ *          并不是一下子存储完一个矩形框所有类的概率，而是先存储所有网格所属第一类的概率，再存储所属第二类的概率，
+ *          具体来说这一中段首先存储了l.out_w*l.out_h个x，然后是l.out_w*l.out_c个y，依次下去，
+ *          最后是l.out_w*l.out_h个C1（属于第一类的概率，用C1表示，下面类似），l.out_w*l.outh个C2,...,
+ *          l.out_w*l.out_c*Cn（假设共有n类），所以可以继续将中段分成几个小段，依次为x,y,w,h,c,C1,C2,...Cn
+ *          小段，每小段的长度都为l.out_w*l.out_c.
+ *          现在回过来看本函数的输入参数，batch就是大段的偏移数（从第几个大段开始，对应是第几张训练图片），
+ *          由location计算得到的n就是中段的偏移数（从第几个中段开始，对应是第几个矩形框），
+ *          entry就是小段的偏移数（从几个小段开始，对应具体是那种参数，x,c还是C1），而loc则是最后的定位，
+ *          前面确定好第几大段中的第几中段中的第几小段的首地址，loc就是从该首地址往后数loc个元素，得到最终定位
+ *          某个具体参数（x或c或C1）的索引值，比如l.output中存储的数据如下所示（这里假设只存了一张训练图片的输出，
+ *          因此batch只能为0；并假设l.out_w=l.out_h=2,l.classes=2）：
+ *          xxxxyyyywwwwhhhhccccC1C1C1C1C2C2C2C2-#-xxxxyyyywwwwhhhhccccC1C1C1C1C2C2C2C2，
+ *          n=0则定位到-#-左边的首地址（表示每个网格预测的第一个矩形框），n=1则定位到-#-右边的首地址（表示每个网格预测的第二个矩形框）
+ *          entry=0,loc=0获取的是x的索引，且获取的是第一个x也即l.out_w*l.out_h个网格中第一个网格中第一个矩形框x参数的索引；
+ *          entry=4,loc=1获取的是c的索引，且获取的是第二个c也即l.out_w*l.out_h个网格中第二个网格中第一个矩形框c参数的索引；
+ *          entry=5,loc=2获取的是C1的索引，且获取的是第三个C1也即l.out_w*l.out_h个网格中第三个网格中第一个矩形框C1参数的索引；
+ *          如果要获取第一个网格中第一个矩形框w参数的索引呢？如果已经获取了其x值的索引，显然用x的索引加上3*l.out_w*l.out_h即可获取到，
+ *          这正是delta_region_box()函数的做法；
+ *          如果要获取第三个网格中第一个矩形框C2参数的索引呢？如果已经获取了其C1值的索引，显然用C1的索引加上l.out_w*l.out_h即可获取到，
+ *          这正是delta_region_class()函数中的做法；
+ *          由上可知，entry=0时,即偏移0个小段，是获取x的索引；entry=4,是获取自信度信息c的索引；entry=5，是获取C1的索引.
+ *          l.output的存储方式大致就是这样，个人觉得说的已经很清楚了，但可视化效果终究不如图文说明～
+*/
 static int entry_index(layer l, int batch, int location, int entry)
 {
     int n =   location / (l.w*l.h);
@@ -343,6 +406,7 @@ static int entry_index(layer l, int batch, int location, int entry)
     return batch*l.outputs + n*l.w*l.h*(4+l.classes+1) + entry*l.w*l.h + loc;
 }
 
+//前向传播
 void forward_yolo_layer(const layer l, network_state state)
 {
     int i, j, b, t, n;
@@ -613,8 +677,10 @@ void forward_yolo_layer(const layer l, network_state state)
         loss, classification_loss, iou_loss);
 }
 
+//误差反向传播
 void backward_yolo_layer(const layer l, network_state state)
 {
+	//直接把 l.delta 拷贝给上一层的 delta。注意 net.delta 指向 prev_layer.delta。
    axpy_cpu(l.batch*l.inputs, 1, l.delta, 1, state.delta, 1);
 }
 
@@ -622,8 +688,11 @@ void backward_yolo_layer(const layer l, network_state state)
 // w,h: image width,height
 // netw,neth: network width,height
 // relative: 1 (all callers seems to pass TRUE)
+//调整预测 box 中心和大小
+
 void correct_yolo_boxes(detection *dets, int n, int w, int h, int netw, int neth, int relative, int letter)
 {
+	//w 和 h 是输入图片的尺寸，netw 和 neth 是网络输入尺寸
     int i;
     // network height (or width)
     int new_w = 0;
@@ -633,7 +702,7 @@ void correct_yolo_boxes(detection *dets, int n, int w, int h, int netw, int neth
     // I think this "rotates" the image to match network to input image w/h ratio
     // new_h and new_w are really just network width and height
     if (letter) {
-        if (((float)netw / w) < ((float)neth / h)) {
+        if (((float)netw / w) < ((float)neth / h)) { //新图片尺寸
             new_w = netw;
             new_h = (h * netw) / w;
         }
@@ -654,7 +723,7 @@ void correct_yolo_boxes(detection *dets, int n, int w, int h, int netw, int neth
     float ratiow = (float)new_w / netw;
     // ratio between rotated network width and network width
     float ratioh = (float)new_h / neth;
-    for (i = 0; i < n; ++i) {
+    for (i = 0; i < n; ++i) { //调整 box 相对新图片尺寸的位置
 
         box b = dets[i].bbox;
         // x = ( x - (deltaw/2)/netw ) / ratiow;
@@ -714,13 +783,16 @@ void correct_yolo_boxes(detection *dets, int n, int w, int h, int netw, int neth
 }
 */
 
+//预测输出中置信度超过阈值的 box 个数
 int yolo_num_detections(layer l, float thresh)
 {
     int i, n;
     int count = 0;
     for (i = 0; i < l.w*l.h; ++i){
         for(n = 0; n < l.n; ++n){
+			////获得置信度偏移位置
             int obj_index  = entry_index(l, 0, n*l.w*l.h + i, 4);
+			//置信度超过阈值
             if(l.output[obj_index] > thresh){
                 ++count;
             }
@@ -755,6 +827,7 @@ void avg_flipped_yolo(layer l)
     }
 }
 
+//获得预测输出中超过阈值的 box
 int get_yolo_detections(layer l, int w, int h, int netw, int neth, float thresh, int *map, int relative, detection *dets, int letter)
 {
     //printf("\n l.batch = %d, l.w = %d, l.h = %d, l.n = %d \n", l.batch, l.w, l.h, l.n);
@@ -769,7 +842,7 @@ int get_yolo_detections(layer l, int w, int h, int netw, int neth, float thresh,
         int col = i % l.w;
         for(n = 0; n < l.n; ++n){
             int obj_index  = entry_index(l, 0, n*l.w*l.h + i, 4);
-            float objectness = predictions[obj_index];
+            float objectness = predictions[obj_index]; //置信度
             //if(objectness <= thresh) continue;    // incorrect behavior for Nan values
             if (objectness > thresh) {
                 //printf("\n objectness = %f, thresh = %f, i = %d, n = %d \n", objectness, thresh, i, n);
@@ -779,14 +852,14 @@ int get_yolo_detections(layer l, int w, int h, int netw, int neth, float thresh,
                 dets[count].classes = l.classes;
                 for (j = 0; j < l.classes; ++j) {
                     int class_index = entry_index(l, 0, n*l.w*l.h + i, 4 + 1 + j);
-                    float prob = objectness*predictions[class_index];
-                    dets[count].prob[j] = (prob > thresh) ? prob : 0;
+                    float prob = objectness*predictions[class_index];//置信度 x 类别概率
+                    dets[count].prob[j] = (prob > thresh) ? prob : 0;//小于阈值则概率置0
                 }
                 ++count;
             }
         }
     }
-    correct_yolo_boxes(dets, count, w, h, netw, neth, relative, letter);
+    correct_yolo_boxes(dets, count, w, h, netw, neth, relative, letter);//调整 box 大小
     return count;
 }
 
