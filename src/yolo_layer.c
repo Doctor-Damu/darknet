@@ -11,43 +11,66 @@
 #include <string.h>
 #include <stdlib.h>
 
+// 构造YOLOV3的yolo层
+// batch 一个batch中包含图片的张数
+// w 输入图片的宽度
+// h 输入图片的高度
+// n 一个cell预测多少个bbox
+// total total Anchor bbox的数目
+// mask 使用的是0,1,2 还是
+// classes 网络需要识别的物体类别数
 layer make_yolo_layer(int batch, int w, int h, int n, int total, int *mask, int classes, int max_boxes)
 {
     int i;
     layer l = { (LAYER_TYPE)0 };
-    l.type = YOLO;
+    l.type = YOLO; //层类别
 
-    l.n = n;
-    l.total = total;
-    l.batch = batch;
-    l.h = h;
-    l.w = w;
-    l.c = n*(classes + 4 + 1);
-    l.out_w = l.w;
-    l.out_h = l.h;
-    l.out_c = l.c;
-    l.classes = classes;
-    l.cost = (float*)xcalloc(1, sizeof(float));
-    l.biases = (float*)xcalloc(total * 2, sizeof(float));
-    if(mask) l.mask = mask;
+    l.n = n; //一个cell预测多少个bbox
+    l.total = total; //anchors的数目，为9
+    l.batch = batch;// 一个batch包含图片的张数
+    l.h = h; // 输入图片的宽度
+    l.w = w; // 输入图片的高度
+    l.c = n*(classes + 4 + 1); // 输入图片的通道数, 3*(20 + 5)
+    l.out_w = l.w;// 输出图片的宽度
+    l.out_h = l.h;// 输出图片的高度
+    l.out_c = l.c;// 输出图片的通道数
+    l.classes = classes;//目标类别数
+    l.cost = (float*)xcalloc(1, sizeof(float)); //yolo层总的损失
+    l.biases = (float*)xcalloc(total * 2, sizeof(float)); //存储bbox的Anchor box的[w,h]
+    if(mask) l.mask = mask; //yolov3有mask传入
     else{
         l.mask = (int*)xcalloc(n, sizeof(int));
         for(i = 0; i < n; ++i){
             l.mask[i] = i;
         }
     }
+	//存储bbox的Anchor box的[w,h]的更新值
     l.bias_updates = (float*)xcalloc(n * 2, sizeof(float));
+	// 一张训练图片经过yolo层后得到的输出元素个数（等于网格数*每个网格预测的矩形框数*每个矩形框的参数个数）
     l.outputs = h*w*n*(classes + 4 + 1);
-    l.inputs = l.outputs;
+	//一张训练图片输入到yolo层的元素个数（注意是一张图片，对于yolo_layer，输入和输出的元素个数相等）
+    l.inputs = l.outputs; 
+	//每张图片含有的真实矩形框参数的个数（max_boxes表示一张图片中最多有max_boxes个ground truth矩形框，每个真实矩形框有
+    //5个参数，包括x,y,w,h四个定位参数，以及物体类别）,注意max_boxes是darknet程序内写死的，实际上每张图片可能
+    //并没有max_boxes个真实矩形框，也能没有这么多参数，但为了保持一致性，还是会留着这么大的存储空间，只是其中的
+    //值为空而已.
     l.max_boxes = max_boxes;
+	// GT: max_boxes*(4+1) 存储max_boxes个bbox的信息，这里是假设图片中GT bbox的数量是
+	//小于max_boxes的，这里是写死的；此处与yolov1是不同的
     l.truths = l.max_boxes*(4 + 1);    // 90*(4 + 1);
+	// yolo层误差项(包含整个batch的)
     l.delta = (float*)xcalloc(batch * l.outputs, sizeof(float));
+	//yolo层所有输出（包含整个batch的）
+    //yolo的输出维度是l.out_w*l.out_h，等于输出的维度，输出的通道数为l.out_c，也即是输入的通道数，具体为：n*(classes+coords+1)
+	//YOLO检测模型将图片分成S*S个网格，每个网格又预测B个矩形框，最后输出的就是这些网格中包含的所有矩形框的信息
     l.output = (float*)xcalloc(batch * l.outputs, sizeof(float));
+	// 存储bbox的Anchor box的[w,h]的初始化,在src/parse.c中parse_yolo函数会加载cfg中Anchor尺寸
     for(i = 0; i < total*2; ++i){
         l.biases[i] = .5;
     }
-
+	// yolo层的前向传播
     l.forward = forward_yolo_layer;
+	// yolo层的反向传播
     l.backward = backward_yolo_layer;
 #ifdef GPU
     l.forward_gpu = forward_yolo_layer_gpu;
@@ -114,6 +137,25 @@ void resize_yolo_layer(layer *l, int w, int h)
 #endif
 }
 
+//获取某个矩形框的4个定位信息，即根据输入的矩形框索引从l.output中获取该矩形框的定位信息x,y,w,h
+//x  yolo_layer的输出，即l.output，包含所有batch预测得到的矩形框信息
+//biases 表示Anchor框的长和宽
+//index 矩形框的首地址（索引，矩形框中存储的首个参数x在l.output中的索引）
+//i 第几行（yolo_layer维度为l.out_w*l.out_c）
+//j 第几列
+//lw 特征图的宽度
+//lh 特征图的高度
+//w 输入图像的宽度
+//h 输入图像的高度
+//stride 不同的特征图具有不同的步长(即是两个grid cell之间跨的像素个数不同)
+
+//biases中存储的是预定以的anchor box的宽和高（输入图尺度），(lw,lh)是yolo层输入的特征图尺度，
+//(w,h)是整个网络输入图尺度，get_yolo_box()函数利用了论文截图中的公式，而且把结果分别利用特征
+//图宽高和输入图宽高做了归一化。既然这个机制是用来限制回归，避免预测很远的目标，那么这个预测
+//范围是多大呢？(b.x,by)最小是(i,j),最大是(i+1,x+1)，即中心点在特征图上最多一定一个像素（假设
+//输入图下采样n得到特征图，特征图中一个像素对应输入图的n个像素）(b.w,b.h)最大是(2.7 * anchor.w,
+//2.7 * anchor.h),最小就是(anchor.w,anchor.h)，这是在输入图尺寸下的值。
+
 box get_yolo_box(float *x, float *biases, int n, int index, int i, int j, int lw, int lh, int w, int h, int stride)
 {
     box b;
@@ -141,6 +183,7 @@ static inline float clip_value(float val, const float max_val)
     else if (val < -max_val) val = -max_val;
     return val;
 }
+
 
 ious delta_yolo_box(box truth, float *x, float *biases, int n, int index, int i, int j, int lw, int lh, int w, int h, float *delta, float scale, int stride, float iou_normalizer, IOU_LOSS iou_loss, int accumulate, int max_delta)
 {
