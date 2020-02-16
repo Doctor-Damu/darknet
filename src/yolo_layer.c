@@ -170,20 +170,20 @@ box get_yolo_box(float *x, float *biases, int n, int index, int i, int j, int lw
     b.h = exp(x[index + 3*stride]) * biases[2*n+1] / h;
     return b;
 }
-
+//修复nan的问题
 static inline float fix_nan_inf(float val)
 {
     if (isnan(val) || isinf(val)) val = 0;
     return val;
 }
-
+//把val限制在[-max_val,max_val]区间中
 static inline float clip_value(float val, const float max_val)
 {
     if (val > max_val) val = max_val;
     else if (val < -max_val) val = -max_val;
     return val;
 }
-
+//调用方式：delta_yolo_box(truth, l.output, l.biases, l.mask[n], box_index, i, j, l.w, l.h, state.net.w, state.net.h, l.delta, (2 - truth.w*truth.h), l.w*l.h, l.iou_normalizer * class_multiplier, l.iou_loss, 1, l.max_delta);
 // 计算预测边界框的误差
 ious delta_yolo_box(box truth, float *x, float *biases, int n, int index, int i, int j, int lw, int lh, int w, int h, float *delta, float scale, int stride, float iou_normalizer, IOU_LOSS iou_loss, int accumulate, int max_delta)
 {
@@ -275,15 +275,17 @@ ious delta_yolo_box(box truth, float *x, float *biases, int n, int index, int i,
     return all_ious;
 }
 
+//对梯度进行平均
 void averages_yolo_deltas(int class_index, int box_index, int stride, int classes, float *delta)
 {
 
     int classes_in_one_box = 0;
     int c;
+	//在一个box里面bbox有多少个类别
     for (c = 0; c < classes; ++c) {
         if (delta[class_index + stride*c] > 0) classes_in_one_box++;
     }
-
+	//梯度除以box中的物体类别数
     if (classes_in_one_box > 0) {
         delta[box_index + 0 * stride] /= classes_in_one_box;
         delta[box_index + 1 * stride] /= classes_in_one_box;
@@ -332,12 +334,17 @@ void delta_yolo_class(float *output, float *delta, int index, int class_id, int 
     }
 }
 
+//调用接口如下：compare_yolo_class(l.output, l.classes, class_index, l.w*l.h, objectness, class_id, 0.25f)
+//获得预测bbox 的类别信息，如果某个类别的概率超过0.25返回1
 int compare_yolo_class(float *output, int classes, int class_index, int stride, float objectness, int class_id, float conf_thresh)
 {
     int j;
     for (j = 0; j < classes; ++j) {
+		//遍历所有类别
         //float prob = objectness * output[class_index + stride*j];
+		//这个stride*j是因为yolo里面数据的排布方式确定，看下面这个函数的解释就知道了
         float prob = output[class_index + stride*j];
+		//大于阈值就返回1
         if (prob > conf_thresh) {
             return 1;
         }
@@ -410,25 +417,32 @@ static int entry_index(layer l, int batch, int location, int entry)
 void forward_yolo_layer(const layer l, network_state state)
 {
     int i, j, b, t, n;
+	//将层输入直接拷贝到层输出
     memcpy(l.output, state.input, l.outputs*l.batch * sizeof(float));
-
+   //在 cpu 里，把预测输出的 x,y,confidence 和80种类别都 sigmoid 激活，确保值在0~1
 #ifndef GPU
     for (b = 0; b < l.batch; ++b) {
         for (n = 0; n < l.n; ++n) {
+			// 获取第b个batch开始的index
             int index = entry_index(l, b, n*l.w*l.h, 0);
+			// 对预测的tx,ty进行逻辑回归预测,
             activate_array(l.output + index, 2 * l.w*l.h, LOGISTIC);        // x,y,
             scal_add_cpu(2 * l.w*l.h, l.scale_x_y, -0.5*(l.scale_x_y - 1), l.output + index, 1);    // scale x,y
-            index = entry_index(l, b, n*l.w*l.h, 4);
+            // 获取第b个batch confidence开始的index
+			index = entry_index(l, b, n*l.w*l.h, 4);
+			// 对预测的confidence以及class进行逻辑回归
             activate_array(l.output + index, (1 + l.classes)*l.w*l.h, LOGISTIC);
         }
     }
 #endif
 
     // delta is zeroed
+	//将yolo层的误差项进行初始化(包含整个batch的)
     memset(l.delta, 0, l.outputs * l.batch * sizeof(float));
+	// inference阶段,到此结束
     if (!state.train) return;
     //float avg_iou = 0;
-    float tot_iou = 0;
+    float tot_iou = 0; //总的IoU（Intersection over Union）
     float tot_giou = 0;
     float tot_diou = 0;
     float tot_ciou = 0;
@@ -443,19 +457,23 @@ void forward_yolo_layer(const layer l, network_state state)
     float avg_anyobj = 0;
     int count = 0;
     int class_count = 0;
-    *(l.cost) = 0;
-    for (b = 0; b < l.batch; ++b) {
+    *(l.cost) = 0; // yolo层的总损失初始化为0
+    for (b = 0; b < l.batch; ++b) {// 遍历batch中的每一张图片
         for (j = 0; j < l.h; ++j) {
-            for (i = 0; i < l.w; ++i) {
-                for (n = 0; n < l.n; ++n) {
+            for (i = 0; i < l.w; ++i) {// 遍历每个cell, 当前cell编号[j, i]
+                for (n = 0; n < l.n; ++n) {// 遍历每一个bbox, 当前bbox编号 [n]
+					// 在这里与yolov2 reorg层是相似的, 获得第j*w+i个cell第n个bbox的index
                     int box_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 0);
+					// 计算第j*w+i个cell第n个bbox在当前特征图上的相对位置[x,y],在网络输入图片上的相对宽度,高度[w,h]
                     box pred = get_yolo_box(l.output, l.biases, l.mask[n], box_index, i, j, l.w, l.h, state.net.w, state.net.h, l.w*l.h);
                     float best_match_iou = 0;
                     int best_match_t = 0;
-                    float best_iou = 0;
-                    int best_t = 0;
-                    for (t = 0; t < l.max_boxes; ++t) {
+                    float best_iou = 0; // 保存最大iou
+                    int best_t = 0;// 保存最大iou的bbox id
+                    for (t = 0; t < l.max_boxes; ++t) {// 遍历每一个GT bbox
+						// 将第t个bbox由float数组转bbox结构体,方便计算iou
                         box truth = float_to_box_stride(state.truth + t*(4 + 1) + b*l.truths, 1);
+						//获取第t个bbox的类别，检查是否有标注错误
                         int class_id = state.truth[t*(4 + 1) + b*l.truths + 4];
                         if (class_id >= l.classes) {
                             printf(" Warning: in txt-labels class_id=%d >= classes=%d in cfg-file. In txt-labels class_id should be [from 0 to %d] \n", class_id, l.classes, l.classes - 1);
@@ -463,44 +481,61 @@ void forward_yolo_layer(const layer l, network_state state)
                             getchar();
                             continue; // if label contains class_id more than number of classes in the cfg-file
                         }
+						// 如果x坐标为0则取消,因为yolov3这里定义了max_boxes个bbox
                         if (!truth.x) break;  // continue;
 
-                        int class_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4 + 1);
-                        int obj_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4);
-                        float objectness = l.output[obj_index];
+                        int class_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4 + 1);//预测bbox 类别s下标
+                        int obj_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4); //预测bbox objectness下标
+                        float objectness = l.output[obj_index]; //预测bbox object置信度
+						//获得预测bbox 的类别信息，如果某个类别的概率超过0.25返回1
                         int class_id_match = compare_yolo_class(l.output, l.classes, class_index, l.w*l.h, objectness, class_id, 0.25f);
 
-                        float iou = box_iou(pred, truth);
+                        float iou = box_iou(pred, truth); // 计算pred bbox与第t个GT bbox之间的iou
+						// 这个地方和原始的DarkNet实现不太一样，多了一个class_id_match=1的限制，即预测bbox的置信度必须大于0.25
                         if (iou > best_match_iou && class_id_match == 1) {
                             best_match_iou = iou;
                             best_match_t = t;
                         }
                         if (iou > best_iou) {
-                            best_iou = iou;
-                            best_t = t;
+                            best_iou = iou; // 记录iou最大的iou
+                            best_t = t; // 记录该GT bbox的编号t
                         }
                     }
+					// 在这里与yolov2 reorg层是相似的, 获得第j*w+i个cell第n个bbox的confidence
                     int obj_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4);
+					// 统计pred bbox的confidence
                     avg_anyobj += l.output[obj_index];
+					 // 与yolov1相似,先将所有pred bbox都当做noobject, 计算其confidence梯度，不过这里多了一个平衡系数
                     l.delta[obj_index] = l.cls_normalizer * (0 - l.output[obj_index]);
+					// best_iou大于阈值则说明pred box有物体,在yolov3中正样本阈值ignore_thresh=.5
                     if (best_match_iou > l.ignore_thresh) {
                         l.delta[obj_index] = 0;
                     }
+					// pred bbox为完全预测正确样本,在yolov3完全预测正确样本的阈值truth_thresh=1.
+					//这个参数在cfg文件中，值为1，这个条件语句永远不可能成立
                     if (best_iou > l.truth_thresh) {
+						// 作者在YOLOV3论文中的第4节提到了这部分。
+						// 作者尝试Faster-RCNN中提到的双IOU策略，当Anchor与GT的IoU大于0.7时，该Anchor被算作正样本
+						//计入损失中，但训练过程中并没有产生好的结果，所以最后放弃了。
                         l.delta[obj_index] = l.cls_normalizer * (1 - l.output[obj_index]);
-
+						 // 获得best_iou对应GT bbox的class的index
                         int class_id = state.truth[best_t*(4 + 1) + b*l.truths + 4];
-                        if (l.map) class_id = l.map[class_id];
+						//yolov3 yolo层中map=0, 不参与计算
+                        if (l.map) class_id = l.map[class_id]; 
+						// 获得best_iou对应pred bbox的class的index
                         int class_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4 + 1);
                         delta_yolo_class(l.output, l.delta, class_index, class_id, l.classes, l.w*l.h, 0, l.focal_loss, l.label_smooth_eps, l.classes_multipliers);
                         box truth = float_to_box_stride(state.truth + best_t*(4 + 1) + b*l.truths, 1);
                         const float class_multiplier = (l.classes_multipliers) ? l.classes_multipliers[class_id] : 1.0f;
-                        delta_yolo_box(truth, l.output, l.biases, l.mask[n], box_index, i, j, l.w, l.h, state.net.w, state.net.h, l.delta, (2 - truth.w*truth.h), l.w*l.h, l.iou_normalizer * class_multiplier, l.iou_loss, 1, l.max_delta);
+                        // 计算pred bbox的[x,y,w,h]的梯度
+						delta_yolo_box(truth, l.output, l.biases, l.mask[n], box_index, i, j, l.w, l.h, state.net.w, state.net.h, l.delta, (2 - truth.w*truth.h), l.w*l.h, l.iou_normalizer * class_multiplier, l.iou_loss, 1, l.max_delta);
                     }
                 }
             }
         }
         for (t = 0; t < l.max_boxes; ++t) {
+			//遍历每一个GT box
+			// 将第t个bbox由float数组转bbox结构体,方便计算iou
             box truth = float_to_box_stride(state.truth + t*(4 + 1) + b*l.truths, 1);
             if (truth.x < 0 || truth.y < 0 || truth.x > 1 || truth.y > 1 || truth.w < 0 || truth.h < 0) {
                 char buff[256];
@@ -512,33 +547,36 @@ void forward_yolo_layer(const layer l, network_state state)
             int class_id = state.truth[t*(4 + 1) + b*l.truths + 4];
             if (class_id >= l.classes) continue; // if label contains class_id more than number of classes in the cfg-file
 
-            if (!truth.x) break;  // continue;
-            float best_iou = 0;
-            int best_n = 0;
-            i = (truth.x * l.w);
-            j = (truth.y * l.h);
+            if (!truth.x) break;  // 如果x坐标为0则取消，因为yolov3定义了max_boxes个bbox,可能实际上没那么多
+            float best_iou = 0; //保存最大的IOU
+            int best_n = 0; //保存最大IOU的bbox index
+            i = (truth.x * l.w); // 获得当前t个GT bbox所在的cell
+            j = (truth.y * l.h); 
             box truth_shift = truth;
-            truth_shift.x = truth_shift.y = 0;
-            for (n = 0; n < l.total; ++n) {
+            truth_shift.x = truth_shift.y = 0; //将truth_shift的box位置移动到0,0
+            for (n = 0; n < l.total; ++n) { // 遍历每一个anchor bbox找到与GT bbox最大的IOU
                 box pred = { 0 };
-                pred.w = l.biases[2 * n] / state.net.w;
-                pred.h = l.biases[2 * n + 1] / state.net.h;
-                float iou = box_iou(pred, truth_shift);
-                if (iou > best_iou) {
-                    best_iou = iou;
-                    best_n = n;
+                pred.w = l.biases[2 * n] / state.net.w; // 计算pred bbox的w在相对整张输入图片的位置
+                pred.h = l.biases[2 * n + 1] / state.net.h; // 计算pred bbox的h在相对整张输入图片的位置
+                float iou = box_iou(pred, truth_shift); // 计算GT box truth_shift 与 预测bbox pred二者之间的IOU
+                if (iou > best_iou) { 
+                    best_iou = iou;// 记录最大的IOU
+                    best_n = n;// 以及记录该bbox的编号n
                 }
             }
-
+            // 上面记录bbox的编号,是否由该层Anchor预测的
             int mask_n = int_index(l.mask, best_n, l.n);
             if (mask_n >= 0) {
                 int class_id = state.truth[t*(4 + 1) + b*l.truths + 4];
                 if (l.map) class_id = l.map[class_id];
-
+				// 获得best_iou对应anchor box的index
                 int box_index = entry_index(l, b, mask_n*l.w*l.h + j*l.w + i, 0);
+				//这个参数是用来控制样本数量不均衡的，即Focal Loss中的alpha
                 const float class_multiplier = (l.classes_multipliers) ? l.classes_multipliers[class_id] : 1.0f;
+				// 计算best_iou对应Anchor bbox的[x,y,w,h]的梯度
                 ious all_ious = delta_yolo_box(truth, l.output, l.biases, best_n, box_index, i, j, l.w, l.h, state.net.w, state.net.h, l.delta, (2 - truth.w*truth.h), l.w*l.h, l.iou_normalizer * class_multiplier, l.iou_loss, 1, l.max_delta);
 
+				// 下面的都是模板检测最新的工作，metricl learning，包括IOU/GIOU/DIOU/CIOU Loss
                 // range is 0 <= 1
                 tot_iou += all_ious.iou;
                 tot_iou_loss += 1 - all_ious.iou;
@@ -551,12 +589,15 @@ void forward_yolo_layer(const layer l, network_state state)
 
                 tot_ciou += all_ious.ciou;
                 tot_ciou_loss += 1 - all_ious.ciou;
-
+				// 获得best_iou对应anchor box的confidence的index
                 int obj_index = entry_index(l, b, mask_n*l.w*l.h + j*l.w + i, 4);
+				//统计confidence
                 avg_obj += l.output[obj_index];
+				// 计算confidence的梯度
                 l.delta[obj_index] = class_multiplier * l.cls_normalizer * (1 - l.output[obj_index]);
-
+				// 获得best_iou对应GT box的class的index
                 int class_index = entry_index(l, b, mask_n*l.w*l.h + j*l.w + i, 4 + 1);
+				// 获得best_iou对应anchor box的class的index
                 delta_yolo_class(l.output, l.delta, class_index, class_id, l.classes, l.w*l.h, &avg_cat, l.focal_loss, l.label_smooth_eps, l.classes_multipliers);
 
                 ++count;
@@ -565,6 +606,7 @@ void forward_yolo_layer(const layer l, network_state state)
                 if (all_ious.iou > .75) recall75 += 1;
             }
 
+			//下面这个过程和上面一样，不过多约束了一个iou_thresh
             // iou_thresh
             for (n = 0; n < l.total; ++n) {
                 int mask_n = int_index(l.mask, n, l.n);
@@ -616,10 +658,13 @@ void forward_yolo_layer(const layer l, network_state state)
         for (j = 0; j < l.h; ++j) {
             for (i = 0; i < l.w; ++i) {
                 for (n = 0; n < l.n; ++n) {
+					// 在这里与yolov2 reorg层是相似的, 获得第j*w+i个cell第n个bbox的index
                     int box_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 0);
+					//获得第j*w+i个cell第n个bbox的类别
                     int class_index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 4 + 1);
+					//特征图的大小
                     const int stride = l.w*l.h;
-
+					//对梯度进行平均
                     averages_yolo_deltas(class_index, box_index, stride, l.classes, l.delta);
                 }
             }
@@ -636,6 +681,7 @@ void forward_yolo_layer(const layer l, network_state state)
         for (j = 0; j < l.h; ++j) {
             for (i = 0; i < l.w; ++i) {
                 for (n = 0; n < l.n; ++n) {
+					//yolov3如果使用的是iou loss，也就是metric learning的方式，那么x,y,w,h的loss可以设置为0
                     int index = entry_index(l, b, n*l.w*l.h + j*l.w + i, 0);
                     no_iou_loss_delta[index + 0 * stride] = 0;
                     no_iou_loss_delta[index + 1 * stride] = 0;
@@ -645,9 +691,12 @@ void forward_yolo_layer(const layer l, network_state state)
             }
         }
     }
+	//计算所有的分类loss
     float classification_loss = l.cls_normalizer * pow(mag_array(no_iou_loss_delta, l.outputs * l.batch), 2);
     free(no_iou_loss_delta);
+	//计算总的loss
     float loss = pow(mag_array(l.delta, l.outputs * l.batch), 2);
+	//计算回归loss
     float iou_loss = loss - classification_loss;
 
     float avg_iou_loss = 0;
@@ -663,6 +712,7 @@ void forward_yolo_layer(const layer l, network_state state)
             avg_iou_loss = count > 0 ? l.iou_normalizer * (tot_giou_loss / count) : 0;
         }
         else {
+			//count代表目标个数
             avg_iou_loss = count > 0 ? l.iou_normalizer * (tot_iou_loss / count) : 0;
         }
         *(l.cost) = avg_iou_loss + classification_loss;
